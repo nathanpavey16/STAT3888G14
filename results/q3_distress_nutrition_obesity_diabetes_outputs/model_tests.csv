@@ -1,0 +1,5 @@
+test,F_statistic,numerator_df,denominator_df,p_value
+"Distress: adjusted overall test",15.0399784617014,3,51,3.87339265962754e-07
+"Nutrient proxy: adjusted test",20.4290598037447,1,53,3.50601545477063e-05
+"Distress by diabetes: PR scale",2.82279922567631,2,49,0.0691356247028586
+"Distress by diabetes: OR scale",2.80242025760783,2,49,0.07041107213989

@@ -1,0 +1,7 @@
+model,n,formula
+"distress",10264,"obese ~ distress + age_group + sex"
+"diet",6244,"obese ~ upf_nutrient_proxy_pct10 + age_group + sex"
+"interaction",4059,"obese ~ distress3 * diabetes + age_group + sex"
+"logistic",4059,"obese ~ distress3 * diabetes + age_group + sex"
+"unambiguous",10264,"obese ~ distress + age_group + sex"
+"four_category",4059,"obese ~ distress * diabetes + age_group + sex"

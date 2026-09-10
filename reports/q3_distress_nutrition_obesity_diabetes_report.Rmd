@@ -1,0 +1,610 @@
+---
+title: "Q3: Psychological Distress, a UPF-Related Nutrient Proxy and Obesity"
+subtitle: "Findings, feasibility and next steps"
+author: "STAT3888 Group 14"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: show
+    self_contained: true
+    theme: readable
+params:
+  data_dir: "../data/raw"
+  output_dir: "../results/q3_distress_nutrition_obesity_diabetes_outputs"
+  export_results: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=FALSE, message=FALSE, warning=TRUE,
+  fig.width=9, fig.height=4.5, dpi=150)
+needed <- c("data.table","dplyr","survey","ggplot2","knitr")
+absent <- setdiff(needed,rownames(installed.packages()))
+if(length(absent)) stop("Install: ",paste(absent,collapse=", "))
+if(packageVersion("dplyr") < "1.1.0") stop("dplyr >= 1.1.0 is required.")
+library(data.table)
+library(dplyr)
+library(survey)
+library(ggplot2)
+library(knitr)
+theme_set(theme_minimal(base_size=12)+theme(plot.title.position="plot",
+  panel.grid.minor=element_blank(),legend.position="top"))
+options(knitr.kable.NA="Unavailable")
+fmt_n <- function(x) format(x,big.mark=",",trim=TRUE,scientific=FALSE)
+fmt_p <- function(x) format.pval(x,digits=3,eps=.001)
+p_text <- function(x) if(x<.001) "p < 0.001" else paste("p =",fmt_p(x))
+ratio_text <- function(x) sprintf("%.2f (95%% CI %.2f-%.2f)",x[1],x[2],x[3])
+cols <- c("No diabetes"="#216B7A","Diabetes"="#AD5735")
+data_dir <- normalizePath(params$data_dir,mustWork=TRUE)
+files <- file.path(data_dir,c("AHSnhs11bsp.csv","AHSnhs11bbi.csv","AHSnpa11bp.csv"))
+stopifnot(all(file.exists(files)))
+source_before <- unname(tools::md5sum(files))
+person_reps <- sprintf("WPM01%02d",1:60)
+biomed_reps <- sprintf("RPWGT%02d",1:60)
+read_selected <- function(path,columns) {
+  stopifnot(all(columns %in% names(fread(path,nrows=0))))
+  as_tibble(fread(path,select=columns,na.strings=c("","NA")))
+}
+nhs_source <- read_selected(files[1],c("ABSLID","ABSPID","AGEB","SEX","FEMLSBC",
+  "BMICATHY","MNKESSGP","MNKESSLR","NHSFINWT",person_reps)) %>%
+  mutate(source_row_id=row_number())
+bio_source <- read_selected(files[2],c("ABSLID","ABSPID","DIABPRVE","NHMSPERW",biomed_reps))
+npa_source <- read_selected(files[3],c("ABSPID","AGEC","SEX","FEMLSBC","BMICATHY",
+  "ENERGYF1","SATPER1","PEADDSD1","NPAFINWT",person_reps)) %>%
+  mutate(source_row_id=row_number())
+stopifnot(!anyNA(nhs_source$ABSLID),!anyNA(nhs_source$ABSPID),
+  !anyNA(bio_source$ABSLID),!anyNA(bio_source$ABSPID),
+  !anyNA(npa_source$ABSPID),!anyDuplicated(npa_source$ABSPID))
+source_inventory <- data.frame(source=basename(files),
+  n=c(nrow(nhs_source),nrow(bio_source),nrow(npa_source)))
+availability <- data.frame(survey=c("NHS","NNPAS"),
+  distress=c(all(c("MNKESSGP","MNKESSLR") %in% names(fread(files[1],nrows=0))),
+             all(c("MNKESSGP","MNKESSLR") %in% names(fread(files[3],nrows=0)))),
+  nutrient_proxy_inputs=c(all(c("SATPER1","PEADDSD1") %in% names(fread(files[1],nrows=0))),
+                          all(c("SATPER1","PEADDSD1") %in% names(fread(files[3],nrows=0)))))
+stopifnot(identical(availability$distress,c(TRUE,FALSE)),
+          identical(availability$nutrient_proxy_inputs,c(FALSE,TRUE)))
+```
+
+```{r cleaning-code, include=FALSE}
+pregnancy_status <- function(sex,stage) case_when(
+  sex==1L ~ "Not pregnant", sex==2L & stage==2L ~ "Pregnant",
+  sex==2L & stage %in% c(1,3:6) ~ "Not pregnant", TRUE ~ "Unknown")
+obesity <- function(x) case_when(x %in% 7:9 ~ 1L,
+  x %in% 1:6 ~ 0L,TRUE ~ NA_integer_)
+common_clean <- function(d) d %>% mutate(
+  pregnancy=pregnancy_status(SEX,FEMLSBC),
+  sex=factor(if_else(SEX %in% 1:2,SEX,NA_integer_),1:2,c("Male","Female")),
+  eligible=age_eligible & pregnancy=="Not pregnant",
+  obese=obesity(BMICATHY),obesity_status=factor(obese,0:1,c("Not obese","Obese")))
+age_labels <- c("18-24","25-34","35-44","45-54","55-64")
+nhs <- nhs_source %>% mutate(age_eligible=AGEB %in% 5:14,
+  age_group=factor(case_when(AGEB %in% 5:6 ~ "18-24",AGEB %in% 7:8 ~ "25-34",
+    AGEB %in% 9:10 ~ "35-44",AGEB %in% 11:12 ~ "45-54",
+    AGEB %in% 13:14 ~ "55-64",TRUE ~ NA_character_),age_labels),
+  distress=factor(if_else(MNKESSGP %in% 1:4,MNKESSGP,NA_integer_),1:4,
+    c("Low","Moderate","High","Very high")),
+  distress3=factor(case_when(MNKESSGP==1L ~ "Low",MNKESSGP==2L ~ "Moderate",
+    MNKESSGP %in% 3:4 ~ "High/very high",TRUE ~ NA_character_),
+    c("Low","Moderate","High/very high")),
+  k10_score=if_else(MNKESSLR %in% 10:50,as.numeric(MNKESSLR),NA_real_)) %>% common_clean()
+
+# Reuse the agreed Q2 definition; the raw nutrient percentages are preserved.
+source("../scripts/build_q2_upf_fat_sugar_proxy.R")
+test_q2_fat_sugar_proxy()
+proxy <- construct_q2_fat_sugar_proxy(npa_source)
+npa <- npa_source %>% left_join(proxy %>% select(ABSPID,upf_nutrient_proxy_pct,
+  upf_nutrient_proxy_pct10,proxy_status),by="ABSPID",relationship="one-to-one") %>%
+  mutate(age_eligible=AGEC %in% 18:64,
+    age_group=cut(AGEC,c(17,24,34,44,54,64),labels=age_labels)) %>% common_clean()
+```
+
+```{r linkage-code, include=FALSE}
+# IDs are not unique for two NHS rows. Never guess a biomedical assignment.
+keys <- c("ABSLID","ABSPID")
+person_duplicates <- nhs %>% count(ABSLID,ABSPID) %>% filter(n>1)
+bio_duplicates <- bio_source %>% count(ABSLID,ABSPID) %>% filter(n>1)
+ambiguous_keys <- bind_rows(person_duplicates,bio_duplicates) %>% distinct(ABSLID,ABSPID)
+nhs <- nhs %>% left_join(mutate(ambiguous_keys,ambiguous_key=TRUE),by=keys,
+  relationship="many-to-one") %>% mutate(ambiguous_key=coalesce(ambiguous_key,FALSE))
+safe_bio <- anti_join(bio_source,ambiguous_keys,by=keys)
+linked <- nhs %>% filter(!ambiguous_key) %>% left_join(
+  mutate(safe_bio,bio_matched=TRUE),by=keys,relationship="one-to-one")
+stopifnot(nrow(linked)==sum(!nhs$ambiguous_key),all(linked$bio_matched))
+# Attach safely linked fields by source row; retain every original person row.
+nhs <- nhs %>% left_join(linked %>% select(source_row_id,DIABPRVE,NHMSPERW,
+  all_of(biomed_reps),bio_matched),by="source_row_id",relationship="one-to-one") %>%
+  mutate(diabetes=factor(case_when(DIABPRVE %in% 1:2 ~ "Diabetes",
+    DIABPRVE %in% 3:4 ~ "No diabetes",TRUE ~ NA_character_),c("No diabetes","Diabetes")))
+stopifnot(nrow(nhs)==nrow(nhs_source),identical(nhs$source_row_id,nhs_source$source_row_id),
+  nrow(npa)==nrow(npa_source),identical(npa$ABSPID,npa_source$ABSPID))
+complete_flag <- function(d,vars,weight) d$eligible &
+  complete.cases(d[,vars,drop=FALSE]) & is.finite(d[[weight]]) & d[[weight]]>0
+core <- c("obese","age_group","sex")
+nhs$distress_complete <- complete_flag(nhs,c(core,"distress"),"NHSFINWT")
+nhs$subgroup_complete <- complete_flag(nhs,c(core,"distress3","diabetes"),"NHMSPERW") &
+  !nhs$ambiguous_key
+nhs$unambiguous_complete <- nhs$distress_complete & !nhs$ambiguous_key
+npa$diet_complete <- complete_flag(npa,c(core,"upf_nutrient_proxy_pct10"),"NPAFINWT")
+```
+
+```{r survey-code, include=FALSE}
+make_design <- function(d,weight,reps) {
+  d <- d[is.finite(d[[weight]]) & d[[weight]]>0,,drop=FALSE]
+  rw <- as.matrix(d[,reps,drop=FALSE])
+  stopifnot(length(reps)==60L,all(is.finite(rw)),all(rw>=0))
+  svrepdesign(data=as.data.frame(d),weights=reformulate(weight),repweights=rw,
+    combined.weights=TRUE,type="other",scale=59/60,rscales=rep(1,60),mse=TRUE)
+}
+# Build full designs before selecting the eligible complete-case domains.
+full_nhs <- make_design(nhs,"NHSFINWT",person_reps)
+full_biomed <- make_design(nhs,"NHMSPERW",biomed_reps)
+full_npa <- make_design(npa,"NPAFINWT",person_reps)
+distress_design <- subset(full_nhs,distress_complete)
+subgroup_design <- subset(full_biomed,subgroup_complete)
+diet_design <- subset(full_npa,diet_complete)
+unambiguous_design <- subset(full_nhs,unambiguous_complete)
+cuts <- as.numeric(quantile(diet_design$variables$upf_nutrient_proxy_pct,seq(0,1,.25)))
+stopifnot(length(unique(cuts))==5L)
+diet_design <- update(diet_design,proxy_quartile=cut(upf_nutrient_proxy_pct,
+  breaks=cuts,include.lowest=TRUE,labels=paste0("Q",1:4)))
+```
+
+```{r prevalence-code, include=FALSE}
+# Weighted prevalence and replicate-weight SE, with a logit-scale t interval.
+prevalence <- function(ds) {
+  z <- svymean(~obese,ds)
+  p <- unname(coef(z)[1]); se <- unname(SE(z)[1])
+  stopifnot(p>0,p<1)
+  ci <- plogis(qlogis(p)+c(-1,1)*qt(.975,degf(ds))*se/(p*(1-p)))
+  data.frame(n=nrow(ds$variables),obese_n=sum(ds$variables$obese),
+    not_obese_n=sum(ds$variables$obese==0),sample_pct=100*mean(ds$variables$obese),
+    weighted_pct=100*p,low=100*ci[1],high=100*ci[2])
+}
+by_group <- function(ds,variable) bind_rows(lapply(levels(ds$variables[[variable]]),
+  function(g) cbind(group=g,prevalence(ds[ds$variables[[variable]]==g,]))))
+distress_observed <- by_group(distress_design,"distress")
+proxy_observed <- by_group(diet_design,"proxy_quartile")
+proxy_observed$range <- sprintf("%.1f-%.1f%%",head(cuts,-1),tail(cuts,-1))
+sample_table <- bind_rows(cbind(analysis="Distress (NHS)",prevalence(distress_design)),
+  cbind(analysis="Nutrient proxy (NNPAS)",prevalence(diet_design)),
+  cbind(analysis="Distress by diabetes (NHS)",prevalence(subgroup_design)))
+```
+
+```{r model-code, include=FALSE}
+distress_formula <- obese~distress+age_group+sex
+diet_formula <- obese~upf_nutrient_proxy_pct10+age_group+sex
+interaction_formula <- obese~distress3*diabetes+age_group+sex
+distress_model <- svyglm(distress_formula,distress_design,family=quasipoisson(link="log"))
+diet_model <- svyglm(diet_formula,diet_design,family=quasipoisson(link="log"))
+interaction_model <- svyglm(interaction_formula,subgroup_design,family=quasipoisson(link="log"))
+logistic_model <- svyglm(interaction_formula,subgroup_design,family=quasibinomial())
+# Targeted secondary checks: record ambiguity and distress-category grouping.
+unambiguous_model <- svyglm(distress_formula,unambiguous_design,family=quasipoisson(link="log"))
+four_category_model <- svyglm(obese~distress*diabetes+age_group+sex,
+  subgroup_design,family=quasipoisson(link="log"))
+```
+
+```{r ratio-test-code, include=FALSE}
+# L selects a coefficient, sum, or difference. V includes survey covariance.
+ratio_ci <- function(model,L) {
+  stopifnot(identical(names(L),names(coef(model))))
+  eta <- sum(L*coef(model)); se <- sqrt(as.numeric(t(L)%*%vcov(model)%*%L))
+  crit <- qt(.975,model$df.residual)
+  data.frame(ratio=exp(eta),low=exp(eta-crit*se),high=exp(eta+crit*se),
+    p_value=2*pt(abs(eta/se),df=model$df.residual,lower.tail=FALSE),
+    log_ratio=eta,SE=se,df=model$df.residual)
+}
+contrast <- function(model,terms) {
+  L <- setNames(rep(0,length(coef(model))),names(coef(model)))
+  stopifnot(all(terms %in% names(L))); L[terms] <- 1
+  ratio_ci(model,L)
+}
+test_term <- function(model,term,label) {
+  z <- regTermTest(model,term)
+  data.frame(test=label,F_statistic=as.numeric(z$Ftest),numerator_df=z$df,
+    denominator_df=z$ddf,p_value=as.numeric(z$p))
+}
+distress_results <- bind_rows(lapply(c("Moderate","High","Very high"),function(g)
+  cbind(comparison=paste(g,"vs low"),contrast(distress_model,paste0("distress",g)))))
+diet_result <- contrast(diet_model,"upf_nutrient_proxy_pct10")
+within_diabetes <- function(model) bind_rows(lapply(c("No diabetes","Diabetes"),function(g)
+  bind_rows(lapply(c("Moderate","High/very high"),function(level) {
+    main <- paste0("distress3",level)
+    terms <- c(main,if(g=="Diabetes") paste0(main,":diabetesDiabetes"))
+    cbind(diabetes=g,comparison=paste(level,"vs low"),contrast(model,terms))
+  }))))
+subgroup_results <- within_diabetes(interaction_model)
+model_tests <- bind_rows(
+  test_term(distress_model,~distress,"Distress: adjusted overall test"),
+  test_term(diet_model,~upf_nutrient_proxy_pct10,"Nutrient proxy: adjusted test"),
+  test_term(interaction_model,~distress3:diabetes,"Distress by diabetes: PR scale"),
+  test_term(logistic_model,~distress3:diabetes,"Distress by diabetes: OR scale"))
+initial_test <- function(ds,var,label) {
+  z <- svychisq(reformulate(c(var,"obesity_status")),ds,statistic="F")
+  data.frame(test=label,F_statistic=unname(z$statistic),numerator_df=unname(z$parameter[1]),
+    denominator_df=unname(z$parameter[2]),p_value=z$p.value)
+}
+initial_tests <- bind_rows(initial_test(distress_design,"distress","Distress categories: unadjusted"),
+  initial_test(diet_design,"proxy_quartile","Proxy quartiles: unadjusted"))
+```
+
+```{r interaction-wald-code, include=FALSE}
+# Q3 has TWO interaction coefficients: jointly test both, not just one.
+interaction_terms <- grep("^distress3.*:diabetesDiabetes$",names(coef(interaction_model)),value=TRUE)
+b <- coef(interaction_model)[interaction_terms]
+V <- vcov(interaction_model)[interaction_terms,interaction_terms,drop=FALSE]
+q_df <- length(b)
+wald_F <- as.numeric(t(b)%*%solve(V,b))/q_df
+wald_p <- pf(wald_F,df1=q_df,df2=interaction_model$df.residual,lower.tail=FALSE)
+stopifnot(q_df==2L,isTRUE(all.equal(wald_p,model_tests$p_value[3],tolerance=1e-10)))
+interaction_components <- bind_rows(lapply(interaction_terms,function(term)
+  cbind(term=term,contrast(interaction_model,term))))
+interaction_worked <- data.frame(F=wald_F,df1=q_df,df2=interaction_model$df.residual,p_value=wald_p)
+```
+
+```{r standardisation-code, include=FALSE}
+# Scenario order: low/moderate/high-very-high without, then with diabetes.
+scenarios <- expand.grid(distress3=c("Low","Moderate","High/very high"),
+  diabetes=c("No diabetes","Diabetes"),stringsAsFactors=FALSE)
+standardise <- function(w,data) {
+  w <- as.numeric(w); data$.w <- w/mean(w)
+  fit <- glm(interaction_formula,data=data,weights=.w,family=quasibinomial())
+  stopifnot(fit$converged,all(is.finite(coef(fit))))
+  p <- vapply(seq_len(nrow(scenarios)),function(i) {
+    nd <- data
+    nd$distress3 <- factor(scenarios$distress3[i],levels(data$distress3))
+    nd$diabetes <- factor(scenarios$diabetes[i],levels(data$diabetes))
+    weighted.mean(predict(fit,newdata=nd,type="response"),w)
+  },numeric(1))
+  delta <- 100*c(p[2]-p[1],p[3]-p[1],p[5]-p[4],p[6]-p[4])
+  c(setNames(qlogis(p),paste0("scenario",1:6)),
+    setNames(delta,c("moderate_no","high_no","moderate_yes","high_yes")),
+    DID_moderate=delta[3]-delta[1],DID_high=delta[4]-delta[2])
+}
+# Each replicate refits AND reweights the common age/sex reference population.
+std <- withReplicates(subgroup_design,standardise,return.replicates=TRUE)
+theta <- coef(std); theta_se <- sqrt(diag(vcov(std)))
+df_std <- logistic_model$df.residual; crit <- qt(.975,df_std)
+std_prevalence <- scenarios
+std_prevalence$prevalence <- 100*plogis(theta[1:6])
+std_prevalence$low <- 100*plogis(theta[1:6]-crit*theta_se[1:6])
+std_prevalence$high <- 100*plogis(theta[1:6]+crit*theta_se[1:6])
+std_difference <- data.frame(contrast=c("Moderate - low: no diabetes","High/very high - low: no diabetes",
+  "Moderate - low: diabetes","High/very high - low: diabetes",
+  "Difference in changes: moderate vs low","Difference in changes: high/very high vs low"),
+  percentage_points=unname(theta[7:12]),low=unname(theta[7:12]-crit*theta_se[7:12]),
+  high=unname(theta[7:12]+crit*theta_se[7:12]),
+  p_value=unname(2*pt(abs(theta[7:12]/theta_se[7:12]),df=df_std,lower.tail=FALSE)))
+# Joint absolute-scale test: both differences-in-changes equal zero.
+delta <- theta[11:12]; delta_V <- vcov(std)[11:12,11:12,drop=FALSE]
+absolute_F <- as.numeric(t(delta)%*%solve(delta_V,delta))/length(delta)
+absolute_test <- data.frame(test="Joint difference in standardized prevalence changes",
+  F_statistic=absolute_F,numerator_df=length(delta),denominator_df=df_std,
+  p_value=pf(absolute_F,length(delta),df_std,lower.tail=FALSE))
+```
+
+```{r sensitivity-code, include=FALSE}
+sensitivity_tests <- bind_rows(
+  test_term(unambiguous_model,~distress,"Distress: exclude ambiguous-ID rows"),
+  test_term(four_category_model,~distress:diabetes,"Diabetes interaction: retain four distress categories"))
+sensitivity_tests$n <- c(nobs(unambiguous_model),nobs(four_category_model))
+sensitivity_ratios <- bind_rows(lapply(c("Moderate","High","Very high"),function(g)
+  cbind(comparison=paste(g,"vs low"),contrast(unambiguous_model,paste0("distress",g)))))
+```
+
+```{r audit-code, include=FALSE}
+d <- subgroup_design$variables
+diabetes_cells <- d %>% group_by(diabetes,distress3) %>% summarise(n=n(),
+  obese_n=sum(obese),not_obese_n=sum(obese==0),.groups="drop")
+four_category_cells <- d %>% count(diabetes,distress,name="n")
+diabetic_n <- sum(d$diabetes=="Diabetes")
+flow_one <- function(x,survey,last_n) data.frame(survey=survey,
+  stage=c("Original person rows","Aged 18-64","Known non-pregnant","Measured BMI available","Complete primary model"),
+  n=c(nrow(x),sum(x$age_eligible),sum(x$eligible),sum(x$eligible & !is.na(x$obese)),last_n))
+flow <- bind_rows(flow_one(nhs,"NHS",nobs(distress_model)),flow_one(npa,"NNPAS",nobs(diet_model)))
+pregnancy_audit <- bind_rows(lapply(list(NHS=nhs,NNPAS=npa),function(x)
+  x %>% filter(age_eligible) %>% group_by(pregnancy) %>%
+    summarise(n=n(),measured_BMI_available=sum(!is.na(obese)),.groups="drop")),.id="survey")
+missing_one <- function(x,vars,survey) bind_rows(lapply(vars,function(v) data.frame(survey=survey,
+  variable=v,eligible_n=sum(x$eligible),unavailable_n=sum(is.na(x[[v]][x$eligible])))))
+missingness <- bind_rows(missing_one(nhs,c("obese","distress","diabetes"),"NHS"),
+  missing_one(npa,c("obese","upf_nutrient_proxy_pct"),"NNPAS"))
+missingness$unavailable_pct <- 100*missingness$unavailable_n/missingness$eligible_n
+linkage_audit <- data.frame(check=c("Repeated NHS person-key groups","Affected NHS person rows",
+  "Safely linked NHS person rows","Eligible complete distress rows excluded by ID sensitivity"),
+  n=c(nrow(person_duplicates),sum(nhs$ambiguous_key),sum(nhs$bio_matched %in% TRUE),
+      nobs(distress_model)-nobs(unambiguous_model)))
+models <- list(distress=distress_model,diet=diet_model,interaction=interaction_model,
+  logistic=logistic_model,unambiguous=unambiguous_model,four_category=four_category_model)
+diagnostics <- bind_rows(lapply(names(models),function(nm) {
+  m <- models[[nm]]
+  data.frame(model=nm,n=nobs(m),converged=isTRUE(m$converged),
+    finite_coefficients=all(is.finite(coef(m))),max_fitted=max(fitted(m)),
+    fitted_above_one=sum(fitted(m)>1),residual_df=m$df.residual)
+}))
+model_specifications <- bind_rows(lapply(names(models),function(nm)
+  data.frame(model=nm,n=nobs(models[[nm]]),formula=paste(deparse(formula(models[[nm]])),collapse=" "))))
+proxy_summary <- data.frame(mean=mean(npa$upf_nutrient_proxy_pct[npa$diet_complete]),
+  median=median(npa$upf_nutrient_proxy_pct[npa$diet_complete]),
+  min=min(npa$upf_nutrient_proxy_pct[npa$diet_complete]),max=max(npa$upf_nutrient_proxy_pct[npa$diet_complete]))
+distress_counts <- distress_design$variables %>% count(distress,name="n")
+stopifnot(all(diagnostics$converged),all(diagnostics$finite_coefficients),
+  all(diagnostics$residual_df>0),nobs(distress_model)==sum(nhs$distress_complete),
+  nobs(diet_model)==sum(npa$diet_complete),nobs(interaction_model)==sum(nhs$subgroup_complete),
+  all(pregnancy_audit$measured_BMI_available[pregnancy_audit$pregnancy=="Pregnant"]==0),
+  !any(c("upf_nutrient_proxy_pct10","pregnancy") %in% all.vars(formula(interaction_model))),
+  identical(source_before,unname(tools::md5sum(files))))
+plots <- list()
+```
+
+# Direct answer
+
+Among **non-pregnant Australians aged 18-64 in the 2011-12 surveys**, after accounting for age group and sex:
+
+- **Psychological distress:** compared with low distress, obesity prevalence was about **`r round(100*(distress_results$ratio[1]-1))`% higher with moderate distress**, **`r round(100*(distress_results$ratio[2]-1))`% higher with high distress**, and **`r round(100*(distress_results$ratio[3]-1))`% higher with very high distress**.
+- **Dietary proxy:** each 10-percentage-point increase was associated with **`r round(100*(diet_result$ratio-1))`% higher relative obesity prevalence**.
+- **Diabetes comparison:** `r if(model_tests$p_value[3]<.05) "The overall interaction suggests a difference by diabetes status." else "The overall interaction is inconclusive."` The moderate-versus-low contrast suggests a possible difference, but this is exploratory. Only **`r diabetic_n` participants have diabetes**.
+
+These are **separate associations from two surveys**, not independent effects in one combined model. The dietary measure is an **unvalidated UPF-related nutrient proxy, not actual UPF consumption**. The results describe existing obesity, not causes or future risk.
+
+# Findings
+
+## Psychological distress and obesity
+
+K10 measures psychological distress over the preceding four weeks; it is not a diagnosis of depression. We use the supplied low, moderate, high and very-high categories, without assuming equally spaced effects. [ABS description of K10](https://www.abs.gov.au/ausstats/abs%40.nsf/Lookup/26DB864DADDA4011CA257AA30014BAA7).
+
+```{r distress-table}
+kable(distress_results %>% transmute(Comparison=comparison,
+  `Adjusted prevalence ratio (95% CI)`=sprintf("%.2f (%.2f-%.2f)",ratio,low,high),
+  `p-value`=fmt_p(p_value)))
+```
+
+The overall distress test gives **`r p_text(model_tests$p_value[1])`**. A ratio of 1 means no difference; 1.4 means 40% higher prevalence, **not** a 40-percentage-point increase or a 40% chance of becoming obese.
+
+```{r distress-plot, fig.cap="Figure 1. Survey-weighted obesity prevalence before age/sex adjustment, with 95% confidence intervals. The table above gives adjusted comparisons."}
+p_distress <- ggplot(distress_observed,aes(group,weighted_pct))+
+  geom_errorbar(aes(ymin=low,ymax=high),width=.1,colour="#216B7A")+
+  geom_point(size=3,colour="#216B7A")+
+  scale_x_discrete(limits=levels(distress_design$variables$distress))+
+  scale_y_continuous(limits=c(0,100),breaks=seq(0,100,20))+
+  labs(x="Psychological distress (K10)",y="People with measured obesity (%)",
+    title="Obesity prevalence by distress category")
+p_distress
+plots[["01_distress_prevalence"]] <- p_distress
+```
+
+## Nutrient proxy and obesity
+
+We use the same definition as Q2: **energy percentage from saturated/trans fats plus added sugars** (`SATPER1 + PEADDSD1`). Trans fat is already included and is not added twice. This score can reflect nutrients in both UPF and non-UPF foods.
+
+For each 10-percentage-point increase, the adjusted prevalence ratio is **`r ratio_text(unlist(diet_result[1,c("ratio","low","high")]))`**; **`r p_text(model_tests$p_value[2])`**. This repeats the shared dietary analysis, not independent confirmation of Q2. It does not establish an effect of UPF itself.
+
+```{r proxy-plot, fig.cap="Figure 2. Survey-weighted obesity prevalence before age/sex adjustment, with 95% CIs. Quartiles split the NNPAS sample into roughly equal-sized groups. The adjusted model uses the numeric score."}
+p_proxy <- ggplot(proxy_observed,aes(group,weighted_pct))+
+  geom_errorbar(aes(ymin=low,ymax=high),width=.1,colour="#216B7A")+
+  geom_point(size=3,colour="#216B7A")+
+  scale_x_discrete(labels=setNames(paste(proxy_observed$group,proxy_observed$range,sep="\n"),proxy_observed$group))+
+  scale_y_continuous(limits=c(0,100),breaks=seq(0,100,20))+
+  labs(x="Nutrient proxy: lowest quarter (Q1) to highest (Q4)",
+    y="People with measured obesity (%)",title="Obesity prevalence across nutrient-proxy groups")
+p_proxy
+plots[["02_proxy_prevalence"]] <- p_proxy
+```
+
+## Does the distress association differ by diabetes?
+
+The primary interaction test gives **p = `r fmt_p(model_tests$p_value[3])`**. It jointly compares the moderate-versus-low and high/very-high-versus-low associations between diabetes groups, **adjusting for age and sex only**. High and very-high distress are combined here, as in the earlier Q3 analysis, to limit parameters in the smaller diabetes sample.
+
+```{r subgroup-table}
+kable(subgroup_results %>% transmute(Group=diabetes,Comparison=comparison,
+  `Adjusted prevalence ratio (95% CI)`=sprintf("%.2f (%.2f-%.2f)",ratio,low,high)))
+```
+
+One component is more suggestive: the **moderate-versus-low association is weaker with diabetes** (ratio of prevalence ratios **`r ratio_text(unlist(interaction_components[1,c("ratio","low","high")]))`**; p = **`r fmt_p(interaction_components$p_value[1])`**). This uncorrected, individual contrast is not the same as the overall two-part interaction test.
+
+**Model caution:** the Poisson working model has `r sum(fitted(interaction_model)>1)` fitted probabilities slightly above 100% (maximum `r sprintf("%.1f",100*max(fitted(interaction_model)))`%). Its subgroup ratios need caution. The logistic alternative stays within 0-100% and also has an inconclusive overall interaction (**p = `r fmt_p(model_tests$p_value[4])`**); it supplies the plot below.
+
+```{r diabetes-plot, fig.cap="Figure 3. Logistic-model obesity probabilities standardized to the same age/sex distribution. Bars show 95% CIs. Different-looking lines or significance in only one group do not establish an interaction."}
+std_plot <- std_prevalence %>% mutate(distress3=factor(distress3,c("Low","Moderate","High/very high")),
+  diabetes=factor(diabetes,c("No diabetes","Diabetes")))
+p_std <- ggplot(std_plot,aes(distress3,prevalence,colour=diabetes,group=diabetes))+
+  geom_line(linewidth=.6)+geom_point(size=3)+
+  geom_errorbar(aes(ymin=low,ymax=high),width=.1,linewidth=.7)+
+  facet_wrap(~diabetes)+scale_colour_manual(values=cols)+
+  scale_x_discrete(labels=c("Low","Moderate","High/\nvery high"))+
+  scale_y_continuous(limits=c(0,100),breaks=seq(0,100,20))+
+  labs(x="Psychological distress (K10)",y="Age/sex-adjusted obesity (%)",
+    title="Distress comparisons with and without diabetes")+theme(legend.position="none")
+p_std
+plots[["03_diabetes_prevalence"]] <- p_std
+```
+
+The table directly compares the changes shown in Figure 3: **change with diabetes minus change without diabetes**, in percentage points.
+
+```{r absolute-contrasts-table}
+kable(std_difference[5:6,] %>% transmute(
+  Comparison=c("Moderate vs low","High/very high vs low"),
+  `Difference in changes (95% CI)`=sprintf("%+.1f (%+.1f to %+.1f)",percentage_points,low,high),
+  `p-value`=fmt_p(p_value)),row.names=FALSE)
+```
+
+The moderate-versus-low absolute contrast is borderline significant before multiple-testing correction. The plot's **joint** absolute-difference test remains inconclusive (**p = `r fmt_p(absolute_test$p_value)`**). This differs from the primary ratio-scale test. The pattern merits follow-up, not a strong claim that the overall association differs or is identical.
+
+# Data and feasibility
+
+The agreed question is feasible **as separate analyses**: distress-obesity and distress-by-diabetes in NHS, and nutrient-proxy-obesity in NNPAS. There is **no jointly observed complete dataset containing distress and the nutrient proxy**. Consequently, mutual adjustment, mediation and distress-by-diet interaction cannot be estimated here.
+
+```{r sample-table}
+kable(sample_table %>% transmute(Analysis=analysis,`Complete n`=fmt_n(n),Obese=fmt_n(obese_n),
+  `Not obese`=fmt_n(not_obese_n),`Obese: sample %`=round(sample_pct,1),
+  `Obese: weighted %`=round(weighted_pct,1)))
+```
+
+The diabetes sample is a subset of the NHS sample; do not add these counts. Each analysis uses all eligible records with **its own required variables and valid survey weights**.
+
+**Pregnancy is handled by restriction, not a model coefficient:** none of the `r sum(pregnancy_audit$n[pregnancy_audit$pregnancy=="Pregnant"])` pregnant respondents aged 18-64 across the two surveys has usable measured BMI. The findings therefore do not cover pregnant adults. The outcome is **measured BMI >=30 kg/m²**, not waist circumference.
+
+# Interpretation and next steps
+
+**Adjusted** means accounting for age and sex differences between groups. **Unadjusted** figures still use survey weights but do not account for those differences. Confidence intervals show sampling uncertainty, not all measurement error or bias.
+
+Next, agree on additional confounders such as education, income, employment, smoking, physical activity and relevant medications where available; assess their timing before adding them. **These are candidates, not variables already adjusted for.** Examine missingness and influential weights. Check non-linearity using a spline for numeric K10 or the dietary score, and test alternative proxy definitions. Suitable methods include survey-weighted proportions, modified Poisson regression for prevalence ratios, logistic regression with standardized probabilities, and joint Wald interaction tests.
+
+Cross-sectional measurements cannot establish which came first. Diabetes may follow obesity, so subgroup conditioning complicates causal interpretation. One-day diet, selective biomedical participation, missing BMI and the unvalidated proxy limit conclusions. Do not fill missing values with averages or select models to obtain small p-values.
+
+<details>
+<summary>Technical details, cleaning and sensitivity checks</summary>
+
+<h2 class="toc-ignore">Variables and processing</h2>
+
+| Role | Source variable(s) and cleaning |
+|:--|:--|
+| Outcome | `BMICATHY`: codes 7-9 obese, 1-6 not obese; other values, including 0/98/99, become missing. |
+| Main distress exposure | NHS `MNKESSGP`: 1-4 retained as a factor; 0/5/8 become missing. `MNKESSLR` retains scores 10-50 for future numeric analyses, but is not used as a linear predictor here. |
+| Main dietary exposure | NNPAS `SATPER1 + PEADDSD1`: Day-1 saturated/trans-fat plus added-sugar energy percentage. Invalid percentages or missing/non-positive `ENERGYF1` produce missing proxy values. No clipping or imputation. |
+| Effect modifier | NHS biomedical `DIABPRVE`: 1-2 diabetes, 3-4 no diabetes (including at-risk); 0/8 become missing. This is the HbA1c-based classification, not type-2-only diabetes. |
+| Adjustments/eligibility | `AGEB` codes 5-14 in NHS and `AGEC` 18-64 in NNPAS; harmonized age groups 18-24, 25-34, 35-44, 45-54, 55-64. `SEX` 1/2 male/female. `FEMLSBC` 2 excludes pregnant women; other known non-pregnant stages 1/3-6 retained. Unknown female pregnancy status excluded; men retained. |
+
+Raw files are unchanged. All `r fmt_n(nrow(nhs))` NHS and `r fmt_n(nrow(npa))` NNPAS source rows remain in separate inclusion audits. The two NHS rows sharing a key are not identical person records: both remain in the standalone analysis. Both are excluded from biomedical linkage rather than guessing an assignment. No cross-survey person join is performed.
+
+The proxy mean is `r sprintf("%.1f",proxy_summary$mean)`% and median `r sprintf("%.1f",proxy_summary$median)`% in its analysis sample. No true UPF percentage is inferred from these summaries.
+
+```{r technical-audit-tables}
+kable(flow)
+kable(missingness,digits=1)
+kable(pregnancy_audit)
+kable(linkage_audit)
+kable(distress_counts)
+kable(diabetes_cells)
+```
+
+Missingness counts overlap and must not be added. Unavailable diabetes includes absent biomedical measurements and ambiguous linkage. The diabetes model uses a selected biomedical subsample, not all NHS respondents with a self-reported diagnosis.
+
+<h2 class="toc-ignore">Secondary checks</h2>
+
+The ID check excludes `r nobs(distress_model)-nobs(unambiguous_model)` complete records: neither ambiguous-ID row entered the main analysis, so its unchanged result is an audit check rather than a distinct sensitivity sample. The grouping sensitivity retains all four distress categories in the diabetes interaction on the same `r nobs(interaction_model)` participants. Its overall p-value is `r fmt_p(sensitivity_tests$p_value[2])`, again inconclusive. These checks do not select a grouping to obtain significance.
+
+```{r sensitivity-tables}
+kable(sensitivity_ratios %>% transmute(Comparison=comparison,
+  `PR (95% CI)`=sprintf("%.2f (%.2f-%.2f)",ratio,low,high)))
+kable(sensitivity_tests %>% transmute(Check=test,n=n,`p-value`=fmt_p(p_value)))
+kable(diagnostics %>% select(model,n,converged,fitted_above_one))
+```
+
+All models converged with finite coefficients. `r if(any(diagnostics$fitted_above_one>0)) "Some modified Poisson fitted values exceed 1; inspect the diagnostic table and interpret their ratios cautiously. Figure 3 uses logistic probabilities bounded between 0 and 1." else "No model produced fitted values above 1."` Secondary estimates and all tests are exploratory and not corrected for multiple comparisons.
+
+Definitions were checked against the supplied `AHSnhsBasicCURFdataItemList.xlsx` (Health, Demographics, Physical measurements & Body Mass, Biomedical level) and `AHSnpaBasicCURFdataItemList.xlsx` (Risk factors - Nutrition, rows 183-184 and 219-220).
+
+</details>
+
+<details id="ci-p-value-code">
+<summary>R code behind confidence intervals and p-values</summary>
+
+These are the same code chunks executed for the report, displayed again without refitting. Run the Rmd from the beginning to create the cleaned objects. CIs are 95%; individual comparisons use two-sided tests. Point estimates, covariance and degrees of freedom all come from the fitted survey models, not rounded table values.
+
+<h2 class="toc-ignore">Survey design and model formulas</h2>
+
+NHS distress uses `NHSFINWT`, NNPAS diet uses `NPAFINWT`, and the NHS diabetes comparison uses `NHMSPERW`. Person replicate weights are `WPM0101-60`; biomedical replicate weights are `RPWGT01-60`. The 60 full-sample-centred jackknife replicates use multiplier 59/60. [ABS technical note](https://www.abs.gov.au/ausstats/abs%40.nsf/Lookup/4363.0.55.001Technical%2BNote12011-13).
+
+```{r show-survey, ref.label="survey-code", eval=FALSE, echo=TRUE}
+```
+
+```{r show-models, ref.label="model-code", eval=FALSE, echo=TRUE}
+```
+
+The primary modified Poisson models estimate **prevalence ratios**, not odds ratios. Logistic regression is used for Figure 3. These are generalized linear models, not ANOVA or ordinary linear regression. Survey covariance replaces the naive independent-observation variance.
+
+<h2 class="toc-ignore">Figures 1-2 and sample-summary CIs</h2>
+
+For weighted prevalence `p`, compute its survey SE, transform it to the logit scale using `SE / (p * (1-p))`, apply a t critical value with `degf(design)`, then transform back to percentages.
+
+```{r show-prevalence, ref.label="prevalence-code", eval=FALSE, echo=TRUE}
+```
+
+<h2 class="toc-ignore">Adjusted ratios, subgroup CIs and initial tests</h2>
+
+For contrast vector `L`, the log-ratio is `L' beta` and its SE is `sqrt(L' V L)`. Exponentiating the t interval yields a PR CI. Within the diabetes group, the contrast adds the relevant distress and interaction coefficients **including their covariance**. `regTermTest()` jointly tests all coefficients for a named term; the initial `svychisq()` tests are survey-adjusted Rao-Scott F tests without age/sex adjustment.
+
+```{r show-ratios-tests, ref.label="ratio-test-code", eval=FALSE, echo=TRUE}
+```
+
+```{r all-tests-table}
+kable(bind_rows(initial_tests,model_tests,absolute_test) %>% mutate(p_value=
+  format.pval(p_value,digits=6,eps=1e-8)),digits=4)
+```
+
+<h2 class="toc-ignore">Worked example: the two-coefficient diabetes interaction</h2>
+
+Unlike Q2's binary vitamin D exposure, Q3 has **two** interaction coefficients. The primary null is that both equal zero. With coefficient vector `b` and its covariance submatrix `V`, `F = (b' V^-1 b) / 2`, evaluated against an F distribution with 2 numerator degrees of freedom and the model's residual denominator degrees of freedom. Testing one coefficient or comparing separate subgroup p-values would not answer the overall question.
+
+```{r show-interaction-wald, ref.label="interaction-wald-code", eval=FALSE, echo=TRUE}
+```
+
+```{r worked-interaction-tables}
+kable(interaction_components %>% select(term,log_ratio,SE,ratio,low,high),digits=6,
+  col.names=c("Interaction term","Log ratio","SE","Ratio of PRs","CI low","CI high"))
+kable(interaction_worked,digits=6)
+```
+
+The two ratio-of-PR CIs above are individual contrasts, not a confidence region for the joint test. `regTermTest()` and the explicit matrix calculation are checked to agree.
+
+<h2 class="toc-ignore">Figure 3: standardized probability CIs and absolute-difference tests</h2>
+
+Each replicate refits the logistic model and reweights the **same reference age/sex distribution** for all six scenarios. `withReplicates()` retains the covariance between their logit probabilities and the absolute contrasts. Sparse diabetic cells may require extrapolation. Probability intervals are constructed on the logit scale; percentage-point contrast intervals are `estimate +/- t * SE`, with `2 * pt(abs(estimate / SE), df, lower.tail=FALSE)` p-values. The joint absolute test uses both differences-in-changes, not the primary PR-scale coefficients.
+
+```{r show-standardisation, ref.label="standardisation-code", eval=FALSE, echo=TRUE}
+```
+
+```{r standardised-tables}
+kable(std_prevalence,digits=2)
+kable(std_difference,digits=4)
+```
+
+<h2 class="toc-ignore">Sensitivity calculations</h2>
+
+These use the same CI and test helpers, with the secondary fits shown earlier.
+
+```{r show-sensitivity, ref.label="sensitivity-code", eval=FALSE, echo=TRUE}
+```
+
+<h2 class="toc-ignore">Cleaning and linkage code</h2>
+
+```{r show-cleaning, ref.label="cleaning-code", eval=FALSE, echo=TRUE}
+```
+
+```{r show-linkage, ref.label="linkage-code", eval=FALSE, echo=TRUE}
+```
+
+</details>
+
+```{r exports, include=FALSE}
+if(isTRUE(params$export_results)) {
+  out <- params$output_dir
+  dir.create(out,recursive=TRUE,showWarnings=FALSE)
+  exports <- list(source_inventory=source_inventory,variable_availability=availability,
+    sample_flow=flow,analysis_samples=sample_table,missingness=missingness,
+    pregnancy_audit=pregnancy_audit,linkage_audit=linkage_audit,
+    distress_counts=distress_counts,distress_observed=distress_observed,
+    proxy_summary=proxy_summary,proxy_quartile_prevalence=proxy_observed,
+    proxy_quartile_cutpoints=data.frame(cutpoint=cuts),
+    distress_associations=distress_results,nutrient_proxy_association=diet_result,
+    initial_tests=initial_tests,model_tests=model_tests,diabetes_cells=diabetes_cells,
+    four_category_cells=four_category_cells,subgroup_prevalence_ratios=subgroup_results,
+    ratio_of_prevalence_ratios=interaction_components,interaction_calculation=interaction_worked,
+    standardised_prevalence=std_prevalence,standardised_differences=std_difference,
+    absolute_interaction_test=absolute_test,sensitivity_tests=sensitivity_tests,
+    sensitivity_ratios=sensitivity_ratios,model_diagnostics=diagnostics,
+    model_specifications=model_specifications,
+    source_checksums=data.frame(file=basename(files),md5=source_before),
+    nhs_inclusion_audit=nhs %>% select(source_row_id,ABSLID,ABSPID,age_eligible,pregnancy,
+      eligible,obese,distress,ambiguous_key,bio_matched,diabetes,distress_complete,
+      subgroup_complete,unambiguous_complete),
+    nnpas_inclusion_audit=npa %>% select(source_row_id,ABSPID,age_eligible,pregnancy,
+      eligible,obese,proxy_status,diet_complete))
+  for(nm in names(exports)) fwrite(exports[[nm]],file.path(out,paste0(nm,".csv")),na="NA")
+  for(nm in names(plots)) ggsave(file.path(out,paste0(nm,".png")),plots[[nm]],width=9,height=4.5,dpi=160)
+  writeLines(trimws(capture.output(sessionInfo()),which="right"),file.path(out,"session_info.txt"))
+}
+```

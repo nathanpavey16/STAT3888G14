@@ -1,0 +1,9 @@
+analysis,term,prevalence_ratio,ci_low,ci_high,p_value,contrast
+Q2A: vitamin D,vitamin_dMild deficiency (30-49),1.03952521570864,0.77939288314335,1.38648003781597,0.788163246229451,Mild deficiency vs adequate
+Q2A: vitamin D,vitamin_dModerate/severe (<30),1.87360467143898,1.17931873227262,2.97662910693636,0.0088180501039554,Moderate/severe deficiency vs adequate
+Q2B/Q3B: discretionary food,discretionary10,1.02928589471093,1.00190878771797,1.05741107976897,0.0363349979039229,Discretionary energy: per 10 percentage points
+Q3A: K10 distress,distressModerate,1.23111527576444,1.10216371444251,1.375153983351,0.000421884191879338,Moderate distress vs low
+Q3A: K10 distress,distressHigh,1.38781404328195,1.20390195468802,1.59982115755406,2.56741262412513e-05,High distress vs low
+Q3A: K10 distress,distressVery high,1.41104149337152,1.17153438721055,1.69951314938081,0.00050294226043165,Very high distress vs low
+Supplement: saturated fat,saturated5,1.06262802285824,1.00597884719556,1.12246725476535,0.0304324262113652,Saturated-fat energy: per 5 percentage points
+Supplement: trans fat,trans01,1.02432402577655,1.0089315611768,1.03995132093922,0.00243482361468244,Trans-fat energy: per 0.1 percentage points

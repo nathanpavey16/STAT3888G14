@@ -1,0 +1,8 @@
+exposure,category,sample_n
+Vitamin D,Adequate (>=50),2020
+Vitamin D,Mild deficiency (30-49),464
+Vitamin D,Moderate/severe (<30),142
+K10 distress,Low,7064
+K10 distress,Moderate,2013
+K10 distress,High,795
+K10 distress,Very high,392

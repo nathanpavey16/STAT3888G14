@@ -1,0 +1,7 @@
+diabetes,distress3,n,obese_n,not_obese_n
+"No diabetes","Low",2641,655,1986
+"No diabetes","Moderate",793,248,545
+"No diabetes","High/very high",436,155,281
+"Diabetes","Low",117,78,39
+"Diabetes","Moderate",41,24,17
+"Diabetes","High/very high",31,23,8

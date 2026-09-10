@@ -1,0 +1,7 @@
+analysis,contrast,diabetes,PR,low,high
+Vitamin D,vitamin_d_binaryDeficient,No diabetes,1.25489482766901,0.997722370044356,1.57835593927841
+Vitamin D,vitamin_d_binaryDeficient,Diabetes,0.71690020153133,0.313778407746591,1.63792627621059
+K10 distress,distress3Moderate,No diabetes,1.25270983877754,1.0309923609897,1.52210821296835
+K10 distress,distress3Moderate,Diabetes,0.745199663505413,0.483743873196331,1.14796810721197
+K10 distress,distress3High/very high,No diabetes,1.56521911184175,1.28247425582442,1.9103002317187
+K10 distress,distress3High/very high,Diabetes,1.31315575123826,1.01371402382121,1.70104978967348

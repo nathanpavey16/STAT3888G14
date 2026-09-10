@@ -1,0 +1,6 @@
+survey,variable,eligible_n,unavailable_n,unavailable_pct
+"NHS","obese",12167,1877,15.4269746034355
+"NHS","distress",12167,51,0.419166598175393
+"NHS","diabetes",12167,7913,65.036574340429
+"NNPAS","obese",7215,969,13.4303534303534
+"NNPAS","upf_nutrient_proxy_pct",7215,4,0.0554400554400554

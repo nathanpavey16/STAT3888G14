@@ -1,4 +1,4 @@
 model,contrast,PR,low,high,n,finding
-"Vitamin D","Mild deficiency vs adequate",1.03952521570864,0.77939288314335,1.38648003781597,2626,"No clear difference detected"
-"Vitamin D","Moderate/severe deficiency vs adequate",1.87360467143898,1.17931873227262,2.97662910693636,2626,"About 87% higher obesity prevalence"
+"Vitamin D","Mild deficiency vs adequate",1.03952521570864,0.779392883143351,1.38648003781597,2626,"No clear difference detected"
+"Vitamin D","Moderate/severe deficiency vs adequate",1.87360467143899,1.17931873227262,2.97662910693637,2626,"About 87% higher obesity prevalence"
 "Nutrient proxy","Nutrient proxy: +10 percentage points",1.13607065105377,1.07354057466463,1.20224289108862,6244,"About 14% higher obesity prevalence"

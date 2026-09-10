@@ -7,7 +7,7 @@ output:
     toc: true
     toc_float: true
     number_sections: true
-    code_folding: hide
+    code_folding: show
     self_contained: true
     theme: readable
 params:
@@ -112,6 +112,10 @@ missingness <- data.frame(variable=c("Measured obesity","Blood vitamin D","Diabe
     sum(is.na(eligible$diabetes)),sum(is.na(eligible$upf_nutrient_proxy_pct)),
     sum(!eligible$biomed_weight_ok)),eligible_n=nrow(eligible))
 missingness$missing_pct <- 100*missingness$missing_n/missingness$eligible_n
+```
+
+```{r survey-design-code, include=FALSE}
+# Full-sample-centred jackknife variance: (59/60) * sum((replicate - full)^2).
 make_design <- function(d,weight,reps) {
   d <- d[is.finite(d[[weight]]) & d[[weight]]>0,,drop=FALSE]
   rw <- as.matrix(d[,reps,drop=FALSE])
@@ -126,6 +130,9 @@ subgroup_design <- subset(full_biomed,subgroup_complete)
 joint_design <- subset(full_biomed,joint_complete)
 full_person <- make_design(all_data,"NPAFINWT",person_reps)
 diet_design <- subset(full_person,diet_complete)
+```
+
+```{r descriptive-setup, include=FALSE}
 v <- vitamin_design$variables
 d <- subgroup_design$variables
 q <- diet_design$variables
@@ -134,7 +141,10 @@ stopifnot(length(unique(cuts))==5L)
 diet_design <- update(diet_design,proxy_quartile=cut(upf_nutrient_proxy_pct,
   breaks=cuts,include.lowest=TRUE,labels=paste0("Q",1:4)))
 q <- diet_design$variables
+```
 
+```{r observed-ci-code, include=FALSE}
+# Logit-transformed Wald CIs keep prevalence limits between 0 and 1.
 prevalence <- function(ds) {
   z <- svymean(~obese,ds)
   p <- unname(coef(z)[1]); se <- unname(SE(z)[1])
@@ -149,6 +159,9 @@ by_group <- function(ds,variable) {
   bind_rows(lapply(levels(ds$variables[[variable]]),function(g)
     cbind(group=g,prevalence(ds[ds$variables[[variable]]==g,]))))
 }
+```
+
+```{r descriptive-tables, include=FALSE}
 vit_observed <- by_group(vitamin_design,"vitamin_d")
 proxy_observed <- by_group(diet_design,"proxy_quartile")
 proxy_observed$range <- sprintf("%.1f-%.1f%%",head(cuts,-1),tail(cuts,-1))
@@ -165,6 +178,9 @@ proxy_summary <- data.frame(
   q1=unname(quantile(q$upf_nutrient_proxy_pct,.25)),
   q3=unname(quantile(q$upf_nutrient_proxy_pct,.75)),
   min=min(q$upf_nutrient_proxy_pct),max=max(q$upf_nutrient_proxy_pct))
+```
+
+```{r initial-tests-code, include=FALSE}
 initial_test <- function(ds,variable,label) {
   z <- svychisq(reformulate(c(variable,"obesity_status")),ds,statistic="F")
   data.frame(test=label,n=nrow(ds$variables),F_statistic=unname(z$statistic),
@@ -173,7 +189,9 @@ initial_test <- function(ds,variable,label) {
 initial_tests <- bind_rows(
   initial_test(vitamin_design,"vitamin_d","Vitamin D categories: unadjusted"),
   initial_test(diet_design,"proxy_quartile","Proxy quartiles: unadjusted"))
+```
 
+```{r model-fits-code, include=FALSE}
 vitamin_formula <- obese~vitamin_d+age_group+sex
 diet_formula <- obese~upf_nutrient_proxy_pct10+age_group+sex
 interaction_formula <- obese~vitamin_d_binary*diabetes+age_group+sex
@@ -188,6 +206,11 @@ same_sample_base <- svyglm(interaction_formula,design=joint_design,
   family=quasipoisson(link="log"))
 same_sample_proxy <- svyglm(update(interaction_formula,.~.+upf_nutrient_proxy_pct10),
   design=joint_design,family=quasipoisson(link="log"))
+```
+
+```{r ratio-helpers-code, include=FALSE}
+# For log-ratio contrast L: eta = L'beta, SE = sqrt(L' V L).
+# Exponentiate eta +/- t critical * SE to obtain ratio confidence limits.
 linear_estimate <- function(model,L) {
   stopifnot(identical(names(L),names(coef(model))))
   eta <- sum(L*coef(model)); se <- sqrt(as.numeric(t(L)%*%vcov(model)%*%L))
@@ -214,7 +237,9 @@ subgroup_contrasts <- function(model) {
     data.frame(diabetes=g,ratio=z[1],low=z[2],high=z[3],row.names=NULL)
   }))
 }
+```
 
+```{r model-inference-code, include=FALSE}
 main_results <- bind_rows(
   one_term(vitamin_model,"vitamin_dMild deficiency (30-49)","Mild deficiency vs adequate","Vitamin D"),
   one_term(vitamin_model,"vitamin_dModerate/severe (<30)","Moderate/severe deficiency vs adequate","Vitamin D"),
@@ -230,6 +255,9 @@ logistic_results <- subgroup_contrasts(logistic_model)
 L <- setNames(rep(0,length(coef(interaction_model))),names(coef(interaction_model)))
 L["vitamin_d_binaryDeficient:diabetesDiabetes"] <- 1
 interaction_ratio <- linear_estimate(interaction_model,L)
+```
+
+```{r sensitivity-inference-code, include=FALSE}
 sensitivity <- bind_rows(
   subgroup_contrasts(same_sample_base) %>% mutate(model="Age/sex only"),
   subgroup_contrasts(same_sample_proxy) %>% mutate(model="Also nutrient proxy"))
@@ -237,7 +265,9 @@ sensitivity$n <- nobs(same_sample_base)
 sensitivity_tests <- bind_rows(
   test_term(same_sample_base,~vitamin_d_binary:diabetes,"Same people: age/sex only"),
   test_term(same_sample_proxy,~vitamin_d_binary:diabetes,"Same people: also nutrient proxy"))
+```
 
+```{r standardised-inference-code, include=FALSE}
 # Standardise all four scenarios to a common weighted AGE/SEX distribution.
 # Each replicate refits the model and reweights the reference population.
 scenarios <- expand.grid(vitamin_d_binary=c("Adequate","Deficient"),
@@ -270,7 +300,9 @@ std_difference <- data.frame(contrast=c("Deficient - adequate: no diabetes",
   percentage_points=unname(theta[5:7]),low=unname(theta[5:7]-crit*theta_se[5:7]),
   high=unname(theta[5:7]+crit*theta_se[5:7]),
   p_value=unname(2*pt(abs(theta[5:7]/theta_se[5:7]),df=logistic_model$df.residual,lower.tail=FALSE)))
+```
 
+```{r setup-diagnostics, include=FALSE}
 models <- list(vitamin=vitamin_model,diet=diet_model,interaction=interaction_model,
   logistic=logistic_model,same_sample_base=same_sample_base,same_sample_proxy=same_sample_proxy)
 diagnostics <- bind_rows(lapply(names(models),function(nm) {
@@ -409,6 +441,8 @@ Each primary analysis uses everyone with the variables **it needs**. There are *
 
 **Confidence intervals** show statistical uncertainty: wider ranges mean less precise estimates.
 
+For the calculations behind every interval and p-value, expand **R code behind confidence intervals and p-values** at the end of this report.
+
 The question is feasible for blood vitamin D, measured obesity and the diabetes comparison. True UPF intake is not measured by our proxy. Other limitations are the small diabetes sample, missing measurements, one-day dietary recall and possible reverse causation.
 
 Next, check whether results depend on the nutrient proxy's shape or definition, examine missingness and influential survey weights, and agree on additional confounders such as socioeconomic position, physical activity, smoking, season and supplements where available. Do not choose adjustments simply to obtain a small p-value.
@@ -416,7 +450,7 @@ Next, check whether results depend on the nutrient proxy's shape or definition, 
 <details>
 <summary>Technical details, cleaning rules and secondary checks</summary>
 
-## Variables and cleaning {.unlisted .unnumbered}
+<h2 class="toc-ignore">Variables and cleaning</h2>
 
 | Field | Use and rule |
 |:--|:--|
@@ -433,7 +467,7 @@ kable(flow,col.names=c("Common inclusion step","Retained n","Excluded at step"))
 kable(missingness,digits=1,col.names=c("Variable","Unavailable n","Eligible n","Unavailable %"))
 ```
 
-## Models and initial tests {.unlisted .unnumbered}
+<h2 class="toc-ignore">Models and initial tests</h2>
 
 The primary formulas are:
 
@@ -454,7 +488,7 @@ kable(model_tests %>% transmute(Test=test,`p-value`=fmt_p(p_value)))
 
 The initial Rao-Scott tests account for survey design, not age/sex. A quartile test asks whether any group differs; it does not identify which groups differ or establish a trend. These use the new analysis-specific samples and replace the earlier common-sample tests.
 
-## Optional nutrient-proxy adjustment {.unlisted .unnumbered}
+<h2 class="toc-ignore">Optional nutrient-proxy adjustment</h2>
 
 This is a **secondary check**, not the primary answer. Both models below use exactly the same `r nobs(same_sample_base)` people, so the comparison isolates the adjustment choice.
 
@@ -472,6 +506,125 @@ kable(diagnostics %>% select(model,n,converged,fitted_above_one),
 All models converged with finite coefficients. `r if(any(diagnostics$fitted_above_one[diagnostics$model %in% c("vitamin","diet","interaction","logistic")]>0)) "Some primary Poisson fitted values exceed 1; their ratios require caution." else "No primary model produced fitted values above 1."` `r if(any(diagnostics$fitted_above_one[diagnostics$model %in% c("same_sample_base","same_sample_proxy")]>0)) "The optional proxy-adjustment check has fitted values above 1 and requires caution." else "The secondary fits also stayed within 0-1."` The displayed probabilities use logistic regression. Confidence intervals reflect sampling uncertainty, not dietary-proxy measurement error.
 
 Definitions come from the supplied `AHSnpaBasicCURFdataItemList.xlsx`. The Rmd reads `AHSnpa11bp.csv` and `AHSnpa11bb.csv` and sources the proxy-construction script. It exports current tables, three figures and an all-person inclusion audit. Participant-level data remain Git-ignored.
+
+</details>
+
+<details id="ci-p-value-code">
+<summary>R code behind confidence intervals and p-values</summary>
+
+The code below is the **same code executed to produce this report**, displayed again without refitting the models. Run the Rmd from the beginning to create its cleaned data, survey designs and model objects. All intervals are 95%; p-values are two-sided or omnibus tests. No multiple-testing correction is applied, so these remain exploratory results.
+
+| Report result | Calculation below |
+|:--|:--|
+| Figures 1-2: observed prevalence CIs | Survey-weighted mean, replicate-weight SE, logit-transformed t interval |
+| Vitamin D and nutrient-proxy PR CIs; diabetes-group PR CIs | Exponentiated coefficient or linear-contrast t interval |
+| Adjusted vitamin D, proxy and interaction p-values | Survey-adjusted Wald F test using `regTermTest()` |
+| Initial category/quartile p-values | Rao-Scott survey-adjusted F test using `svychisq()` |
+| Figure 3: standardized prevalence CIs | Refit and standardize in each replicate; logit-transformed t interval |
+| Figure 3: changes and difference-in-changes CIs/p-values | Replicate-weight covariance; t intervals and two-sided t tests |
+| Optional proxy-adjustment sensitivity CIs/p-values | The same ratio-CI and Wald-test functions, on identical participants |
+
+<h2 class="toc-ignore">Survey weights and model fits</h2>
+
+For an estimate or vector of estimates, the variance is based on the 60 replicate estimates, centred on the full-sample estimate, with multiplier 59/60. Thus `vcov(model)` below is **survey-adjusted**, not the ordinary independent-observation GLM covariance. Descriptive intervals use `degf(design)`; model intervals/tests use the fitted model's residual degrees of freedom, not the sample size minus two.
+
+```{r show-survey-design, ref.label="survey-design-code", eval=FALSE, echo=TRUE}
+```
+
+```{r show-model-fits, ref.label="model-fits-code", eval=FALSE, echo=TRUE}
+```
+
+<h2 class="toc-ignore">Figures 1-2: observed prevalence intervals</h2>
+
+For weighted prevalence \(p\), the interval is computed on the logit scale using standard error \(SE(p)/[p(1-p)]\), then transformed back to percentages. These are not age/sex-adjusted intervals. The same helper also supplies the sample-summary exports.
+
+```{r show-observed-ci, ref.label="observed-ci-code", eval=FALSE, echo=TRUE}
+```
+
+```{r show-observed-calls, echo=TRUE, results='hide'}
+# The points and limits used in Figures 1 and 2:
+by_group(vitamin_design, "vitamin_d")
+by_group(diet_design, "proxy_quartile")
+```
+
+<h2 class="toc-ignore">Adjusted ratios, subgroup intervals and model p-values</h2>
+
+`L` selects the coefficient(s) defining a comparison. In the diabetes group, the vitamin D association is the **sum of the vitamin D and interaction coefficients**. Its variance includes their covariance; adding the two standard errors would be incorrect. A ratio CI includes 1 when that comparison is compatible with no association at the 5% level.
+
+```{r show-ratio-helpers, ref.label="ratio-helpers-code", eval=FALSE, echo=TRUE}
+```
+
+```{r show-model-inference, ref.label="model-inference-code", eval=FALSE, echo=TRUE}
+```
+
+The vitamin D p-value jointly tests its **two category coefficients**, whereas each vitamin D CI concerns one comparison with adequate levels. The proxy and binary interaction tests each have one numerator degree of freedom. These are Wald tests, not ANOVA of the raw obesity values or likelihood-ratio tests.
+
+```{r show-model-test-statistics}
+kable(model_tests %>% transmute(Test=test, F=F_statistic,
+  `Numerator df`=numerator_df, `Denominator df`=denominator_df,
+  `p-value`=format.pval(p_value,digits=6,eps=1e-6)), digits=4)
+```
+
+<h3 class="toc-ignore">Worked example: the primary interaction p-value</h3>
+
+Here the null hypothesis is that the deficient-versus-adequate **prevalence ratio is the same in both diabetes groups**. For this single coefficient, the Wald F statistic equals the squared t statistic. The code also obtains the ratio of those prevalence ratios and its CI directly from the fitted model; no reported values are hard-coded.
+
+```{r interaction-worked-example, echo=TRUE}
+term <- "vitamin_d_binaryDeficient:diabetesDiabetes"
+beta <- unname(coef(interaction_model)[term])
+se <- sqrt(vcov(interaction_model)[term, term])
+df <- interaction_model$df.residual
+t_stat <- beta / se
+F_stat <- t_stat^2
+p <- pf(F_stat, df1=1, df2=df, lower.tail=FALSE)
+ratio <- exp(beta)
+ci <- exp(beta + c(-1, 1) * qt(.975, df) * se)
+
+interaction_calculation <- data.frame(
+  beta=beta, SE=se, t=t_stat, F=F_stat, df1=1, df2=df, p_value=p,
+  ratio_of_PRs=ratio, CI_low=ci[1], CI_high=ci[2])
+stopifnot(isTRUE(all.equal(p, model_tests$p_value[3], tolerance=1e-10)),
+          isTRUE(all.equal(unname(c(ratio, ci)),
+                           unname(interaction_ratio), tolerance=1e-10)))
+knitr::kable(data.frame(Statistic=names(interaction_calculation),
+  Value=as.numeric(interaction_calculation[1, ])), digits=6)
+```
+
+The interaction estimate is `r sprintf("%.2f",abs(t_stat))` standard errors from zero. The ratio of prevalence ratios is `r sprintf("%.3f",ratio)` (95% CI `r sprintf("%.3f to %.3f",ci[1],ci[2])`). Its interval includes 1, consistent with p = `r sprintf("%.6f",p)`.
+
+<h2 class="toc-ignore">Initial unadjusted category tests</h2>
+
+These test independence between obesity and the vitamin D categories or proxy quartiles, allowing for survey design but not adjusting for age/sex. `svychisq(..., statistic="F")` supplies the Rao-Scott F approximation and its design-adjusted degrees of freedom; do not substitute an ordinary `chisq.test()`.
+
+```{r show-initial-tests, ref.label="initial-tests-code", eval=FALSE, echo=TRUE}
+```
+
+```{r show-initial-statistics}
+kable(initial_tests %>% transmute(Test=test, n=n, F=F_statistic,
+  `Numerator df`=numerator_df, `Denominator df`=denominator_df,
+  `p-value`=format.pval(p_value,digits=6,eps=1e-6)), digits=4)
+```
+
+<h2 class="toc-ignore">Figure 3: standardized probabilities and absolute contrasts</h2>
+
+Each replicate refits the logistic model and averages each scenario's predictions over the **same age/sex reference population**, using that replicate's weights. Scenario order is adequate/no diabetes, deficient/no diabetes, adequate/diabetes, deficient/diabetes. `withReplicates()` estimates the joint covariance of the four logit probabilities and the absolute contrasts. This preserves dependence between predictions instead of treating the plotted points as independent.
+
+The four probability CIs are constructed on the logit scale. Absolute changes use \(\widehat{\Delta}\pm t_{0.975,df}SE(\widehat{\Delta})\); their p-values are `2 * pt(abs(estimate / SE), df, lower.tail=FALSE)`. These tests concern **percentage-point differences**, not the primary prevalence-ratio interaction.
+
+```{r show-standardisation, ref.label="standardised-inference-code", eval=FALSE, echo=TRUE}
+```
+
+```{r show-standardised-contrasts}
+kable(std_difference, digits=6,
+  col.names=c("Contrast","Percentage points","CI low","CI high","p-value"))
+```
+
+<h2 class="toc-ignore">Optional proxy-adjustment sensitivity</h2>
+
+The two fits were specified under **Survey weights and model fits** above. These calls reuse the same contrast and Wald-test helpers on the same complete-case sample; they do not change the primary analysis.
+
+```{r show-sensitivity-inference, ref.label="sensitivity-inference-code", eval=FALSE, echo=TRUE}
+```
 
 </details>
 

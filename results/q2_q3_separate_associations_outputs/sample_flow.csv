@@ -1,0 +1,12 @@
+survey,stage,sample_n
+NNPAS,Raw person records,12153
+NNPAS,Age 18-64,7332
+NNPAS,"Known non-pregnant, age 18-64",7215
+NNPAS,"Also usable obesity, age group and sex",6246
+NNPAS,Complete vitamin D primary model,2626
+NNPAS,Complete discretionary-food primary model,6244
+NHS,Raw person records,20426
+NHS,Age 18-64,12332
+NHS,"Known non-pregnant, age 18-64",12167
+NHS,"Also usable obesity, age group and sex",10290
+NHS,Complete distress primary model,10264

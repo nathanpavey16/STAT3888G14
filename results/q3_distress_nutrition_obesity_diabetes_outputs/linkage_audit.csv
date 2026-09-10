@@ -1,0 +1,5 @@
+check,n
+"Repeated NHS person-key groups",1
+"Affected NHS person rows",2
+"Safely linked NHS person rows",20424
+"Eligible complete distress rows excluded by ID sensitivity",0

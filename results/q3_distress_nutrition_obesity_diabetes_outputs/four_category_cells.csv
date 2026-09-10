@@ -1,0 +1,9 @@
+diabetes,distress,n
+"No diabetes","Low",2641
+"No diabetes","Moderate",793
+"No diabetes","High",292
+"No diabetes","Very high",144
+"Diabetes","Low",117
+"Diabetes","Moderate",41
+"Diabetes","High",17
+"Diabetes","Very high",14

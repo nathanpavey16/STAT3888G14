@@ -1,0 +1,3 @@
+comparison,F_statistic,numerator_df,denominator_df,p_value
+Vitamin D by diabetes,1.72909060336676,1,51,0.194409241294654
+Distress by diabetes,2.82279922567631,2,49,0.0691356247028586
