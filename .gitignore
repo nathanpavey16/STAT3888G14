@@ -1,0 +1,22 @@
+# Local survey microdata: distribute separately to authorised teammates.
+/data/raw/
+# Derived participant-level files also contain survey identifiers.
+/data/derived/
+# Participant-level inclusion audits contain survey identifiers.
+/results/**/*inclusion_audit.csv
+/archive/**/*inclusion_audit.csv
+
+# Any future participant-level derived datasets.
+*.rds
+*.RDS
+
+# R session state and temporary rendering files.
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+/reports/*.knit.md
+/reports/*.utf8.md
+/reports/*_cache/
+/reports/*_files/
+/r-render-env/

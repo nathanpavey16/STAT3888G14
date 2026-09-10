@@ -1,0 +1,7 @@
+diabetes,vitamin_d,n,obese_n,not_obese_n
+"No diabetes","Adequate (>=50)",1947,492,1455
+"No diabetes","Mild deficiency (30-49)",436,129,307
+"No diabetes","Moderate/severe (<30)",136,37,99
+"Diabetes","Adequate (>=50)",66,44,22
+"Diabetes","Mild deficiency (30-49)",27,14,13
+"Diabetes","Moderate/severe (<30)",5,2,3

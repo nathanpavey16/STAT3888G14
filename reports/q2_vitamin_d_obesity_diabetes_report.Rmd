@@ -1,0 +1,503 @@
+---
+title: "Q2: Blood Vitamin D, a UPF-Related Nutrient Proxy and Obesity"
+subtitle: "Plain-language findings, feasibility and next steps"
+author: "STAT3888 Group 14"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: hide
+    self_contained: true
+    theme: readable
+params:
+  data_dir: "../data/raw"
+  output_dir: "../results/q2_vitamin_d_obesity_diabetes_outputs"
+  export_results: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=FALSE, message=FALSE, warning=TRUE,
+                     fig.width=9, fig.height=4.8, dpi=150)
+needed <- c("data.table","dplyr","survey","ggplot2","knitr")
+absent <- setdiff(needed, rownames(installed.packages()))
+if(length(absent)) stop("Install: ", paste(absent, collapse=", "))
+if(packageVersion("dplyr") < "1.1.0") stop("dplyr >= 1.1.0 is required.")
+library(data.table)
+library(dplyr)
+library(survey)
+library(ggplot2)
+library(knitr)
+theme_set(theme_minimal(base_size=12) +
+  theme(plot.title.position="plot", plot.caption=element_text(hjust=0),
+        panel.grid.minor=element_blank(), legend.position="top"))
+options(knitr.kable.NA="Unavailable")
+fmt_n <- function(x) format(x,big.mark=",",trim=TRUE,scientific=FALSE)
+fmt_p <- function(x) format.pval(x,digits=3,eps=.001)
+ratio_text <- function(x) sprintf("%.2f (95%% CI %.2f-%.2f)",x[1],x[2],x[3])
+cols <- c("No diabetes"="#216B7A","Diabetes"="#AD5735")
+data_dir <- normalizePath(params$data_dir,mustWork=TRUE)
+files <- file.path(data_dir,c("AHSnpa11bp.csv","AHSnpa11bb.csv"))
+stopifnot(all(file.exists(files)))
+source_before <- unname(tools::md5sum(files))
+biomed_reps <- sprintf("RPWGT%02d",1:60)
+person_reps <- sprintf("WPM01%02d",1:60)
+read_columns <- function(path, columns) {
+  stopifnot(all(columns %in% names(fread(path,nrows=0))))
+  as_tibble(fread(path,select=columns,na.strings=c("","NA")))
+}
+person <- read_columns(files[1],c("ABSPID","AGEC","SEX","FEMLSBC","BMICATHY",
+  "ENERGYF1","SATPER1","PEADDSD1","NPAFINWT",person_reps)) %>%
+  mutate(source_row_id=row_number())
+biomedical <- read_columns(files[2],c("ABSPID","VDLCMRGT","DIABPRVE",
+                                     "NHMSPERW",biomed_reps))
+stopifnot(!anyNA(person$ABSPID),!anyNA(biomedical$ABSPID),
+  !anyDuplicated(person$ABSPID),!anyDuplicated(biomedical$ABSPID),
+  setequal(person$ABSPID,biomedical$ABSPID))
+source("../scripts/build_q2_upf_fat_sugar_proxy.R")
+test_q2_fat_sugar_proxy()
+proxy <- construct_q2_fat_sugar_proxy(person)
+all_data <- person %>%
+  left_join(biomedical,by="ABSPID",relationship="one-to-one") %>%
+  left_join(proxy %>% select(ABSPID,upf_nutrient_proxy_pct,
+    upf_nutrient_proxy_pct10,proxy_status),by="ABSPID",relationship="one-to-one") %>%
+  mutate(
+    age_eligible=AGEC %in% 18:64,
+    sex=factor(if_else(SEX %in% 1:2,SEX,NA_integer_),1:2,c("Male","Female")),
+    age_group=cut(AGEC,c(17,24,34,44,54,64),
+      labels=c("18-24","25-34","35-44","45-54","55-64")),
+    pregnancy=case_when(SEX==1L ~ "Not pregnant",
+      SEX==2L & FEMLSBC==2L ~ "Pregnant",
+      SEX==2L & FEMLSBC %in% c(1,3:6) ~ "Not pregnant",TRUE ~ "Unknown"),
+    eligible=age_eligible & pregnancy=="Not pregnant",
+    obese=case_when(BMICATHY %in% 7:9 ~ 1L,
+                   BMICATHY %in% 1:6 ~ 0L,TRUE ~ NA_integer_),
+    obesity_status=factor(obese,0:1,c("Not obese","Obese")),
+    vitamin_d=factor(if_else(VDLCMRGT %in% 1:3,VDLCMRGT,NA_integer_),1:3,
+      c("Adequate (>=50)","Mild deficiency (30-49)","Moderate/severe (<30)")),
+    vitamin_d_binary=factor(case_when(VDLCMRGT==1L ~ "Adequate",
+      VDLCMRGT %in% 2:3 ~ "Deficient",TRUE ~ NA_character_),
+      c("Adequate","Deficient")),
+    diabetes=factor(case_when(DIABPRVE %in% 1:2 ~ "Diabetes",
+      DIABPRVE %in% 3:4 ~ "No diabetes",TRUE ~ NA_character_),
+      c("No diabetes","Diabetes")),
+    biomed_weight_ok=is.finite(NHMSPERW) & NHMSPERW>0,
+    person_weight_ok=is.finite(NPAFINWT) & NPAFINWT>0)
+
+# Analysis-specific eligibility: the primary vitamin D models do not require diet.
+required_vit <- c("obese","vitamin_d","age_group","sex")
+required_sub <- c(required_vit,"diabetes")
+all_data$vitamin_complete <- all_data$eligible & all_data$biomed_weight_ok &
+  complete.cases(all_data[,required_vit])
+all_data$subgroup_complete <- all_data$eligible & all_data$biomed_weight_ok &
+  complete.cases(all_data[,required_sub])
+all_data$joint_complete <- all_data$subgroup_complete &
+  !is.na(all_data$upf_nutrient_proxy_pct10)
+all_data$diet_complete <- all_data$eligible & all_data$person_weight_ok &
+  complete.cases(all_data[,c("obese","upf_nutrient_proxy_pct10","age_group","sex")])
+stopifnot(nrow(all_data)==nrow(person),identical(all_data$ABSPID,person$ABSPID))
+eligible <- filter(all_data,eligible)
+pregnancy_audit <- all_data %>% filter(age_eligible) %>% group_by(pregnancy) %>%
+  summarise(n=n(),measured_obesity_available=sum(!is.na(obese)),.groups="drop")
+pregnant_n <- sum(all_data$age_eligible & all_data$pregnancy=="Pregnant")
+stopifnot(sum(all_data$age_eligible & all_data$pregnancy=="Pregnant" &
+  !is.na(all_data$obese))==0)
+flow <- data.frame(stage=c("All source participants","Aged 18-64","Known non-pregnant",
+  "Measured obesity available"),
+  n=c(nrow(all_data),sum(all_data$age_eligible),nrow(eligible),sum(!is.na(eligible$obese))))
+flow$excluded_at_step <- c(0L,-diff(flow$n))
+missingness <- data.frame(variable=c("Measured obesity","Blood vitamin D","Diabetes",
+  "Nutrient proxy","Positive biomedical weight"),
+  missing_n=c(sum(is.na(eligible$obese)),sum(is.na(eligible$vitamin_d)),
+    sum(is.na(eligible$diabetes)),sum(is.na(eligible$upf_nutrient_proxy_pct)),
+    sum(!eligible$biomed_weight_ok)),eligible_n=nrow(eligible))
+missingness$missing_pct <- 100*missingness$missing_n/missingness$eligible_n
+make_design <- function(d,weight,reps) {
+  d <- d[is.finite(d[[weight]]) & d[[weight]]>0,,drop=FALSE]
+  rw <- as.matrix(d[,reps,drop=FALSE])
+  stopifnot(length(reps)==60L,all(is.finite(rw)),all(rw>=0))
+  svrepdesign(data=as.data.frame(d),weights=reformulate(weight),repweights=rw,
+    combined.weights=TRUE,type="other",scale=59/60,rscales=rep(1,60),mse=TRUE)
+}
+
+full_biomed <- make_design(all_data,"NHMSPERW",biomed_reps)
+vitamin_design <- subset(full_biomed,vitamin_complete)
+subgroup_design <- subset(full_biomed,subgroup_complete)
+joint_design <- subset(full_biomed,joint_complete)
+full_person <- make_design(all_data,"NPAFINWT",person_reps)
+diet_design <- subset(full_person,diet_complete)
+v <- vitamin_design$variables
+d <- subgroup_design$variables
+q <- diet_design$variables
+cuts <- as.numeric(quantile(q$upf_nutrient_proxy_pct,seq(0,1,.25)))
+stopifnot(length(unique(cuts))==5L)
+diet_design <- update(diet_design,proxy_quartile=cut(upf_nutrient_proxy_pct,
+  breaks=cuts,include.lowest=TRUE,labels=paste0("Q",1:4)))
+q <- diet_design$variables
+
+prevalence <- function(ds) {
+  z <- svymean(~obese,ds)
+  p <- unname(coef(z)[1]); se <- unname(SE(z)[1])
+  stopifnot(p>0,p<1)
+  ci <- plogis(qlogis(p)+c(-1,1)*qt(.975,degf(ds))*se/(p*(1-p)))
+  data.frame(n=nrow(ds$variables),obese_n=sum(ds$variables$obese),
+    not_obese_n=sum(ds$variables$obese==0),
+    sample_pct=100*mean(ds$variables$obese),weighted_pct=100*p,
+    low=100*ci[1],high=100*ci[2])
+}
+by_group <- function(ds,variable) {
+  bind_rows(lapply(levels(ds$variables[[variable]]),function(g)
+    cbind(group=g,prevalence(ds[ds$variables[[variable]]==g,]))))
+}
+vit_observed <- by_group(vitamin_design,"vitamin_d")
+proxy_observed <- by_group(diet_design,"proxy_quartile")
+proxy_observed$range <- sprintf("%.1f-%.1f%%",head(cuts,-1),tail(cuts,-1))
+sample_table <- bind_rows(cbind(analysis="Vitamin D",prevalence(vitamin_design)),
+  cbind(analysis="Nutrient proxy",prevalence(diet_design)),
+  cbind(analysis="Vitamin D by diabetes",prevalence(subgroup_design)))
+binary_cells <- d %>% group_by(diabetes,vitamin_d_binary) %>%
+  summarise(n=n(),obese_n=sum(obese),not_obese_n=sum(obese==0),.groups="drop")
+cells <- d %>% group_by(diabetes,vitamin_d) %>%
+  summarise(n=n(),obese_n=sum(obese),not_obese_n=sum(obese==0),.groups="drop")
+proxy_summary <- data.frame(
+  mean=mean(q$upf_nutrient_proxy_pct),sd=sd(q$upf_nutrient_proxy_pct),
+  median=median(q$upf_nutrient_proxy_pct),
+  q1=unname(quantile(q$upf_nutrient_proxy_pct,.25)),
+  q3=unname(quantile(q$upf_nutrient_proxy_pct,.75)),
+  min=min(q$upf_nutrient_proxy_pct),max=max(q$upf_nutrient_proxy_pct))
+initial_test <- function(ds,variable,label) {
+  z <- svychisq(reformulate(c(variable,"obesity_status")),ds,statistic="F")
+  data.frame(test=label,n=nrow(ds$variables),F_statistic=unname(z$statistic),
+    numerator_df=unname(z$parameter[1]),denominator_df=unname(z$parameter[2]),p_value=z$p.value)
+}
+initial_tests <- bind_rows(
+  initial_test(vitamin_design,"vitamin_d","Vitamin D categories: unadjusted"),
+  initial_test(diet_design,"proxy_quartile","Proxy quartiles: unadjusted"))
+
+vitamin_formula <- obese~vitamin_d+age_group+sex
+diet_formula <- obese~upf_nutrient_proxy_pct10+age_group+sex
+interaction_formula <- obese~vitamin_d_binary*diabetes+age_group+sex
+vitamin_model <- svyglm(vitamin_formula,design=vitamin_design,family=quasipoisson(link="log"))
+diet_model <- svyglm(diet_formula,design=diet_design,family=quasipoisson(link="log"))
+interaction_model <- svyglm(interaction_formula,design=subgroup_design,
+  family=quasipoisson(link="log"))
+logistic_model <- svyglm(interaction_formula,design=subgroup_design,family=quasibinomial())
+
+# Secondary comparison holds participant IDs fixed when adding the proxy.
+same_sample_base <- svyglm(interaction_formula,design=joint_design,
+  family=quasipoisson(link="log"))
+same_sample_proxy <- svyglm(update(interaction_formula,.~.+upf_nutrient_proxy_pct10),
+  design=joint_design,family=quasipoisson(link="log"))
+linear_estimate <- function(model,L) {
+  stopifnot(identical(names(L),names(coef(model))))
+  eta <- sum(L*coef(model)); se <- sqrt(as.numeric(t(L)%*%vcov(model)%*%L))
+  crit <- qt(.975,model$df.residual)
+  c(estimate=exp(eta),low=exp(eta-crit*se),high=exp(eta+crit*se))
+}
+one_term <- function(model,term,label,model_label) {
+  L <- setNames(rep(0,length(coef(model))),names(coef(model)))
+  stopifnot(term %in% names(L)); L[term] <- 1
+  x <- linear_estimate(model,L)
+  data.frame(model=model_label,contrast=label,PR=x[1],low=x[2],high=x[3],row.names=NULL)
+}
+test_term <- function(model,term,label) {
+  z <- regTermTest(model,term)
+  data.frame(test=label,F_statistic=as.numeric(z$Ftest),numerator_df=z$df,
+    denominator_df=z$ddf,p_value=as.numeric(z$p))
+}
+subgroup_contrasts <- function(model) {
+  bind_rows(lapply(c("No diabetes","Diabetes"),function(g) {
+    L <- setNames(rep(0,length(coef(model))),names(coef(model)))
+    L["vitamin_d_binaryDeficient"] <- 1
+    if(g=="Diabetes") L["vitamin_d_binaryDeficient:diabetesDiabetes"] <- 1
+    z <- linear_estimate(model,L)
+    data.frame(diabetes=g,ratio=z[1],low=z[2],high=z[3],row.names=NULL)
+  }))
+}
+
+main_results <- bind_rows(
+  one_term(vitamin_model,"vitamin_dMild deficiency (30-49)","Mild deficiency vs adequate","Vitamin D"),
+  one_term(vitamin_model,"vitamin_dModerate/severe (<30)","Moderate/severe deficiency vs adequate","Vitamin D"),
+  one_term(diet_model,"upf_nutrient_proxy_pct10","Nutrient proxy: +10 percentage points","Nutrient proxy"))
+main_results$n <- c(nobs(vitamin_model),nobs(vitamin_model),nobs(diet_model))
+model_tests <- bind_rows(
+  test_term(vitamin_model,~vitamin_d,"Vitamin D: age/sex adjusted"),
+  test_term(diet_model,~upf_nutrient_proxy_pct10,"Nutrient proxy: age/sex adjusted"),
+  test_term(interaction_model,~vitamin_d_binary:diabetes,"Primary diabetes interaction: PR scale"),
+  test_term(logistic_model,~vitamin_d_binary:diabetes,"Secondary diabetes interaction: OR scale"))
+subgroup_results <- subgroup_contrasts(interaction_model)
+logistic_results <- subgroup_contrasts(logistic_model)
+L <- setNames(rep(0,length(coef(interaction_model))),names(coef(interaction_model)))
+L["vitamin_d_binaryDeficient:diabetesDiabetes"] <- 1
+interaction_ratio <- linear_estimate(interaction_model,L)
+sensitivity <- bind_rows(
+  subgroup_contrasts(same_sample_base) %>% mutate(model="Age/sex only"),
+  subgroup_contrasts(same_sample_proxy) %>% mutate(model="Also nutrient proxy"))
+sensitivity$n <- nobs(same_sample_base)
+sensitivity_tests <- bind_rows(
+  test_term(same_sample_base,~vitamin_d_binary:diabetes,"Same people: age/sex only"),
+  test_term(same_sample_proxy,~vitamin_d_binary:diabetes,"Same people: also nutrient proxy"))
+
+# Standardise all four scenarios to a common weighted AGE/SEX distribution.
+# Each replicate refits the model and reweights the reference population.
+scenarios <- expand.grid(vitamin_d_binary=c("Adequate","Deficient"),
+  diabetes=c("No diabetes","Diabetes"),stringsAsFactors=FALSE)
+standardise <- function(w,data) {
+  w <- as.numeric(w); data$.w <- w/mean(w)
+  fit <- glm(interaction_formula,data=data,weights=.w,family=quasibinomial())
+  stopifnot(fit$converged,all(is.finite(coef(fit))))
+  p <- vapply(seq_len(nrow(scenarios)),function(i) {
+    nd <- data
+    nd$vitamin_d_binary <- factor(scenarios$vitamin_d_binary[i],levels(data$vitamin_d_binary))
+    nd$diabetes <- factor(scenarios$diabetes[i],levels(data$diabetes))
+    weighted.mean(predict(fit,newdata=nd,type="response"),w)
+  },numeric(1))
+  c(setNames(qlogis(p),paste0("scenario",1:4)),
+    PD_no=100*(p[2]-p[1]),PD_yes=100*(p[4]-p[3]),
+    difference_PD=100*((p[4]-p[3])-(p[2]-p[1])))
+}
+std <- withReplicates(subgroup_design,standardise,return.replicates=TRUE)
+theta <- coef(std); theta_se <- sqrt(diag(vcov(std)))
+crit <- qt(.975,logistic_model$df.residual)
+std_prevalence <- scenarios %>% mutate(
+  vitamin_d_binary=factor(vitamin_d_binary,c("Adequate","Deficient")),
+  diabetes=factor(diabetes,c("No diabetes","Diabetes")))
+std_prevalence$prevalence <- 100*plogis(theta[1:4])
+std_prevalence$low <- 100*plogis(theta[1:4]-crit*theta_se[1:4])
+std_prevalence$high <- 100*plogis(theta[1:4]+crit*theta_se[1:4])
+std_difference <- data.frame(contrast=c("Deficient - adequate: no diabetes",
+  "Deficient - adequate: diabetes","Difference in differences: diabetes - no diabetes"),
+  percentage_points=unname(theta[5:7]),low=unname(theta[5:7]-crit*theta_se[5:7]),
+  high=unname(theta[5:7]+crit*theta_se[5:7]),
+  p_value=unname(2*pt(abs(theta[5:7]/theta_se[5:7]),df=logistic_model$df.residual,lower.tail=FALSE)))
+
+models <- list(vitamin=vitamin_model,diet=diet_model,interaction=interaction_model,
+  logistic=logistic_model,same_sample_base=same_sample_base,same_sample_proxy=same_sample_proxy)
+diagnostics <- bind_rows(lapply(names(models),function(nm) {
+  m <- models[[nm]]
+  data.frame(model=nm,n=nobs(m),converged=isTRUE(m$converged),
+    finite_coefficients=all(is.finite(coef(m))),max_fitted=max(fitted(m)),
+    fitted_above_one=sum(fitted(m)>1),residual_df=m$df.residual)
+}))
+inclusion_audit <- all_data %>% select(ABSPID,source_row_id,age_eligible,pregnancy,
+  eligible,obese,vitamin_d,diabetes,proxy_status,biomed_weight_ok,
+  vitamin_complete,subgroup_complete,joint_complete,diet_complete)
+diabetic_n <- sum(d$diabetes=="Diabetes")
+sparse_n <- sum(d$diabetes=="Diabetes" & d$vitamin_d=="Moderate/severe (<30)")
+describe_result <- function(row) {
+  if(row$low>1) sprintf("About %.0f%% higher obesity prevalence",100*(row$PR-1))
+  else if(row$high<1) sprintf("About %.0f%% lower obesity prevalence",100*(1-row$PR))
+  else "No clear difference detected"
+}
+main_results$finding <- vapply(seq_len(nrow(main_results)),
+  function(i) describe_result(main_results[i,]),character(1))
+stopifnot(
+  all(diagnostics$converged),all(diagnostics$finite_coefficients),all(diagnostics$residual_df>0),
+  all(complete.cases(v[,required_vit])),all(complete.cases(d[,required_sub])),
+  nrow(inclusion_audit)==nrow(person),identical(inclusion_audit$ABSPID,person$ABSPID),
+  nobs(interaction_model)==sum(all_data$subgroup_complete),
+  identical(same_sample_base$survey.design$variables$ABSPID,
+            same_sample_proxy$survey.design$variables$ABSPID),
+  !("upf_nutrient_proxy_pct10" %in% all.vars(formula(interaction_model))),
+  !("upf_nutrient_proxy_pct10" %in% all.vars(formula(logistic_model))),
+  !("upf_nutrient_proxy_pct10" %in% all.vars(formula(vitamin_model))),
+  !("diabetes" %in% all.vars(formula(diet_model))),
+  identical(source_before,unname(tools::md5sum(files))))
+plots <- list()
+
+```
+
+# Direct answer
+
+Among **non-pregnant Australians aged 18-64 in the 2011-12 survey**, after accounting for age and sex:
+
+- **Vitamin D:** `r main_results$finding[2]` in the moderate/severe deficiency group compared with adequate vitamin D. Mild deficiency: `r tolower(main_results$finding[1])`.
+- **Dietary proxy:** `r main_results$finding[3]` for each 10-percentage-point increase in the nutrient proxy.
+- **Diabetes comparison:** `r if(model_tests$p_value[3]<.05) "There is exploratory evidence that the vitamin D-obesity association differs by diabetes status." else "There is no clear evidence that the vitamin D-obesity association differs by diabetes status."` The small diabetes group leaves substantial uncertainty.
+
+**Prevalence means the percentage of people who had obesity when measured. These are associations, not causes or predictions of future obesity.** Our dietary measure is an **unvalidated UPF-related nutrient proxy**, not actual UPF consumption. It adds the energy percentages from saturated/trans fats and added sugars.
+
+# Findings
+
+## Blood vitamin D and obesity
+
+```{r vitamin-results}
+kable(main_results[1:2,] %>% transmute(Comparison=contrast,
+  `Prevalence ratio (95% confidence interval)`=sprintf("%.2f (%.2f-%.2f)",PR,low,high)),
+  caption="Age/sex-adjusted vitamin D comparisons; adequate means at least 50 nmol/L.")
+```
+
+The overall vitamin D test gives **p = `r fmt_p(model_tests$p_value[1])`**. A prevalence ratio of 1 means no difference; a ratio near 2 means approximately twice the prevalence, **not that an individual is “very likely” to be obese**. For illustration, twice a hypothetical 20% is 40%. Moderate and severe deficiency are combined here; severe deficiency alone was not estimated.
+
+```{r vitamin-plot, fig.height=4.2, fig.cap="Figure 1. Observed survey-weighted obesity percentages before age/sex adjustment. Bars show 95% confidence intervals. The adjusted results are in the table above."}
+p_vit <- ggplot(vit_observed,aes(group,weighted_pct))+
+  geom_errorbar(aes(ymin=low,ymax=high),width=.10,colour="#216B7A")+
+  geom_point(size=3,colour="#216B7A")+
+  scale_x_discrete(limits=levels(v$vitamin_d),labels=setNames(
+    c("Adequate\n>=50","Mild deficiency\n30-49","Moderate/severe\n<30"),levels(v$vitamin_d)))+
+  scale_y_continuous(limits=c(0,100),breaks=seq(0,100,20))+
+  labs(x="Blood vitamin D (nmol/L)",y="People with measured obesity (%)",
+    title="Obesity prevalence by vitamin D category")
+p_vit
+plots[["01_vitamin_d_prevalence"]] <- p_vit
+```
+
+## Nutrient proxy and obesity
+
+Each **10-percentage-point increase** in the proxy was associated with **`r sprintf("%.0f",100*abs(main_results$PR[3]-1))`% `r if(main_results$PR[3]>=1) "higher" else "lower"` relative obesity prevalence** after age/sex adjustment (prevalence ratio **`r ratio_text(unlist(main_results[3,c("PR","low","high")]))`**; `r if(model_tests$p_value[2]<.001) "p < 0.001" else paste("p =",fmt_p(model_tests$p_value[2]))`).
+
+This is not a `r sprintf("%.0f",100*abs(main_results$PR[3]-1))`-percentage-point increase in obesity, and it does not establish an effect of UPF itself. This model is **separate from the vitamin D models**.
+
+```{r proxy-plot, fig.height=4.2, fig.cap="Figure 2. Observed survey-weighted obesity percentages before age/sex adjustment. Quartiles split participants into roughly equal-sized groups. The adjusted model uses the original numeric score."}
+p_proxy <- ggplot(proxy_observed,aes(group,weighted_pct))+
+  geom_errorbar(aes(ymin=low,ymax=high),width=.10,colour="#216B7A")+
+  geom_point(size=3,colour="#216B7A")+
+  scale_x_discrete(labels=setNames(sprintf("%s\n%s",proxy_observed$group,
+    proxy_observed$range),proxy_observed$group))+
+  scale_y_continuous(limits=c(0,100),breaks=seq(0,100,20))+
+  labs(x="Nutrient proxy: lowest quarter (Q1) to highest (Q4)",
+    y="People with measured obesity (%)",title="Obesity prevalence across nutrient-proxy groups")
+p_proxy
+plots[["02_proxy_prevalence"]] <- p_proxy
+```
+
+## Does the vitamin D association differ by diabetes?
+
+**`r if(model_tests$p_value[3]<.05) "The interaction test suggests a difference, but this needs cautious interpretation." else "We cannot confidently establish a difference between the groups."`** The main interaction test gives **p = `r fmt_p(model_tests$p_value[3])`**. It adjusts for **age and sex only**, with **no dietary-proxy adjustment**.
+
+For this comparison, deficiency means **<50 versus >=50 nmol/L**. We combine the deficient categories because only `r sparse_n` participants with diabetes have moderate/severe deficiency.
+
+```{r subgroup-table}
+kable(subgroup_results %>% transmute(Group=diabetes,
+  `Deficient vs adequate: prevalence ratio (95% CI)`=sprintf("%.3f (%.3f-%.3f)",ratio,low,high)))
+```
+
+```{r diabetes-plot, fig.height=4.5, fig.cap="Figure 3. Estimated obesity percentages after giving every group the same age/sex distribution. Bars are 95% confidence intervals. The lines connect estimates; opposite directions alone do not demonstrate an interaction."}
+p_std <- ggplot(std_prevalence,aes(vitamin_d_binary,prevalence,colour=diabetes,group=diabetes))+
+  geom_line(linewidth=.6)+geom_point(size=3)+
+  geom_errorbar(aes(ymin=low,ymax=high),width=.10,linewidth=.7)+
+  facet_wrap(~diabetes)+scale_colour_manual(values=cols)+
+  scale_y_continuous(limits=c(0,100),breaks=seq(0,100,20))+
+  labs(x="Blood vitamin D",y="Age/sex-adjusted obesity (%)",
+    title="Vitamin D comparisons with and without diabetes")+
+  theme(legend.position="none")
+p_std
+plots[["03_diabetes_prevalence"]] <- p_std
+```
+
+In this probability plot, deficiency corresponds to a change of **`r sprintf("%+.1f",std_difference$percentage_points[1])` percentage points** without diabetes and **`r sprintf("%+.1f",std_difference$percentage_points[2])`** with diabetes. The difference between those changes is **`r sprintf("%.1f",std_difference$percentage_points[3])` points** (95% CI **`r sprintf("%.1f to %.1f",std_difference$low[3],std_difference$high[3])`**; p = **`r fmt_p(std_difference$p_value[3])`**).
+
+`r if(std_difference$low[3]<=0 && std_difference$high[3]>=0) "That interval includes zero: the different-looking lines are not sufficient evidence of a real difference." else "That interval excludes zero, providing exploratory evidence of an absolute difference."` Only **`r diabetic_n` participants have diabetes**. A non-significant result does not prove that the associations are identical.
+
+# Data and feasibility
+
+The two source files join one-to-one by person ID. All `r fmt_n(nrow(person))` original participants remain in the audit. After age and pregnancy restrictions, `r fmt_n(nrow(eligible))` are eligible; `r fmt_n(sum(is.na(eligible$obese)))` lack usable measured obesity.
+
+```{r sample-table}
+kable(sample_table %>% transmute(Analysis=analysis,`Complete participants`=fmt_n(n),
+  Obese=fmt_n(obese_n),`Not obese`=fmt_n(not_obese_n),`Obese: sample %`=round(sample_pct,1),
+  `Obese: weighted %`=round(weighted_pct,1)))
+```
+
+Each primary analysis uses everyone with the variables **it needs**. There are **`r fmt_n(sum(all_data$joint_complete))` participants with all variables**, used only for the optional diet-adjustment comparison. The sample sizes above overlap; do not add them. Survey weighting accounts for representation, but does not eliminate missing-data bias.
+
+**Pregnancy is handled by restriction:** none of the `r pregnant_n` pregnant participants has usable measured BMI. The findings therefore cannot cover pregnant adults.
+
+# How to interpret this, and what next
+
+**Adjusted** means the model accounts for age and sex differences between groups. **Unadjusted** means it does not, although survey weights are still used. Neither guarantees that all confounding has been removed.
+
+**Confidence intervals** show statistical uncertainty: wider ranges mean less precise estimates.
+
+The question is feasible for blood vitamin D, measured obesity and the diabetes comparison. True UPF intake is not measured by our proxy. Other limitations are the small diabetes sample, missing measurements, one-day dietary recall and possible reverse causation.
+
+Next, check whether results depend on the nutrient proxy's shape or definition, examine missingness and influential survey weights, and agree on additional confounders such as socioeconomic position, physical activity, smoking, season and supplements where available. Do not choose adjustments simply to obtain a small p-value.
+
+<details>
+<summary>Technical details, cleaning rules and secondary checks</summary>
+
+## Variables and cleaning {.unlisted .unnumbered}
+
+| Field | Use and rule |
+|:--|:--|
+| `BMICATHY` | Measured obesity: codes 7-9 = BMI >=30 kg/m²; 1-6 = not obese; other codes become missing. |
+| `VDLCMRGT` | Blood vitamin D categories 1-3 retained; 0/8 become missing. No continuous blood concentration is invented. |
+| `SATPER1 + PEADDSD1` | Day-1 saturated/trans-fat plus added-sugar energy percentage. Trans fat is already included; do not add it again. Missing/non-positive energy or invalid percentages produce a missing proxy. No imputation or clipping. |
+| `DIABPRVE` | HbA1c-based known/new diabetes (1-2) versus no diabetes (3-4, including at-risk). Other codes become missing. Not type-2-specific. |
+| `AGEC, SEX, FEMLSBC` | Ages 18-64; age groups 18-24, 25-34, 35-44, 45-54, 55-64; sex. Exclude pregnant women (code 2). Retain men and women with codes 1 or 3-6; exclude unknown pregnancy status. |
+
+The nutrient proxy's mean is `r sprintf("%.1f",proxy_summary$mean)`% and median `r sprintf("%.1f",proxy_summary$median)`% in the dietary sample. `r sum(all_data$ENERGYF1==0,na.rm=TRUE)` zero-energy participants receive a missing proxy. Raw records are unchanged; missing values are not replaced with averages.
+
+```{r technical-counts}
+kable(flow,col.names=c("Common inclusion step","Retained n","Excluded at step"))
+kable(missingness,digits=1,col.names=c("Variable","Unavailable n","Eligible n","Unavailable %"))
+```
+
+## Models and initial tests {.unlisted .unnumbered}
+
+The primary formulas are:
+
+```r
+obese ~ vitamin_d + age_group + sex
+obese ~ upf_nutrient_proxy_pct10 + age_group + sex
+obese ~ vitamin_d_binary * diabetes + age_group + sex
+```
+
+Survey-weighted modified Poisson models estimate prevalence ratios. A logistic model with the **same no-proxy interaction formula** supplies Figure 3's probabilities, standardised to a common age/sex distribution. Its absolute-difference test and the primary ratio-scale interaction test are different comparisons, so their p-values can differ.
+
+The full survey designs are built before restricting to eligible complete cases. Biomedical models use `NHMSPERW` and `RPWGT01-60`; the dietary model uses `NPAFINWT` and `WPM0101-60`. We use 60 jackknife replicates, multiplier 59/60 and full-sample centring, following the [ABS approach](https://www.abs.gov.au/ausstats/abs%40.nsf/Lookup/4363.0.55.001Technical%2BNote12011-13). Figure 3 refits and reweights each replicate. Its shared age/sex distribution can require extrapolation in sparse diabetic cells.
+
+```{r technical-tests}
+kable(initial_tests %>% transmute(Test=test,Participants=n,`p-value`=fmt_p(p_value)))
+kable(model_tests %>% transmute(Test=test,`p-value`=fmt_p(p_value)))
+```
+
+The initial Rao-Scott tests account for survey design, not age/sex. A quartile test asks whether any group differs; it does not identify which groups differ or establish a trend. These use the new analysis-specific samples and replace the earlier common-sample tests.
+
+## Optional nutrient-proxy adjustment {.unlisted .unnumbered}
+
+This is a **secondary check**, not the primary answer. Both models below use exactly the same `r nobs(same_sample_base)` people, so the comparison isolates the adjustment choice.
+
+```{r sensitivity-results}
+kable(sensitivity %>% transmute(Model=model,Group=diabetes,
+  `Deficient vs adequate PR (95% CI)`=sprintf("%.2f (%.2f-%.2f)",ratio,low,high)))
+kable(sensitivity_tests %>% transmute(Comparison=test,`Interaction p-value`=fmt_p(p_value)))
+```
+
+```{r technical-diagnostics}
+kable(diagnostics %>% select(model,n,converged,fitted_above_one),
+  col.names=c("Model","n","Converged","Fitted values above 1"))
+```
+
+All models converged with finite coefficients. `r if(any(diagnostics$fitted_above_one[diagnostics$model %in% c("vitamin","diet","interaction","logistic")]>0)) "Some primary Poisson fitted values exceed 1; their ratios require caution." else "No primary model produced fitted values above 1."` `r if(any(diagnostics$fitted_above_one[diagnostics$model %in% c("same_sample_base","same_sample_proxy")]>0)) "The optional proxy-adjustment check has fitted values above 1 and requires caution." else "The secondary fits also stayed within 0-1."` The displayed probabilities use logistic regression. Confidence intervals reflect sampling uncertainty, not dietary-proxy measurement error.
+
+Definitions come from the supplied `AHSnpaBasicCURFdataItemList.xlsx`. The Rmd reads `AHSnpa11bp.csv` and `AHSnpa11bb.csv` and sources the proxy-construction script. It exports current tables, three figures and an all-person inclusion audit. Participant-level data remain Git-ignored.
+
+</details>
+
+```{r exports, include=FALSE}
+if(isTRUE(params$export_results)) {
+  out <- params$output_dir
+  dir.create(out,recursive=TRUE,showWarnings=FALSE)
+  exports <- list(sample_flow=flow,analysis_samples=sample_table,missingness=missingness,
+    proxy_summary=proxy_summary,main_associations=main_results,model_tests=model_tests,
+    initial_tests=initial_tests,vitamin_d_observed=vit_observed,
+    proxy_quartile_prevalence=proxy_observed,proxy_quartile_cutpoints=data.frame(cutpoint=cuts),
+    diabetes_cells=cells,diabetes_binary_cells=binary_cells,
+    subgroup_prevalence_ratios=subgroup_results,subgroup_odds_ratios=logistic_results,
+    ratio_of_prevalence_ratios=data.frame(ratio=interaction_ratio[1],
+      low=interaction_ratio[2],high=interaction_ratio[3]),
+    standardised_prevalence=std_prevalence,standardised_differences=std_difference,
+    same_sample_proxy_sensitivity=sensitivity,sensitivity_tests=sensitivity_tests,
+    pregnancy_audit=pregnancy_audit,model_diagnostics=diagnostics,
+    participant_inclusion_audit=inclusion_audit,
+    source_checksums=data.frame(file=basename(files),md5=source_before))
+  exports$model_specifications <- bind_rows(lapply(names(models),function(nm)
+    data.frame(model=nm,n=nobs(models[[nm]]),
+      formula=paste(deparse(formula(models[[nm]])),collapse=" "))))
+  for(nm in names(exports)) fwrite(exports[[nm]],file.path(out,paste0(nm,".csv")),na="NA")
+  for(nm in names(plots)) ggsave(file.path(out,paste0(nm,".png")),plots[[nm]],
+    width=9,height=4.5,dpi=160)
+  writeLines(capture.output(sessionInfo()),file.path(out,"session_info.txt"))
+}
+```

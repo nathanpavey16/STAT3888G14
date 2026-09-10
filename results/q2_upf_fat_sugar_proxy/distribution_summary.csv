@@ -1,0 +1,3 @@
+group,n_retained,n_available,n_missing,mean_pct,sd_pct,min_pct,q1_pct,median_pct,q3_pct,max_pct
+All source participants,12153,12149,4,22.0769690509507,9.52797151780066,0,15.107,20.977,27.773,100
+Non-pregnant adults aged 18-64,7215,7211,4,21.5569572874775,9.82261298173869,1.123,14.342,20.2,27.326,100

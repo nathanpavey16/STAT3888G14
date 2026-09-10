@@ -1,0 +1,7 @@
+model,n,formula
+"vitamin",2626,"obese ~ vitamin_d + age_group + sex"
+"diet",6244,"obese ~ upf_nutrient_proxy_pct10 + age_group + sex"
+"interaction",2617,"obese ~ vitamin_d_binary * diabetes + age_group + sex"
+"logistic",2617,"obese ~ vitamin_d_binary * diabetes + age_group + sex"
+"same_sample_base",2616,"obese ~ vitamin_d_binary * diabetes + age_group + sex"
+"same_sample_proxy",2616,"obese ~ vitamin_d_binary + diabetes + age_group + sex + upf_nutrient_proxy_pct10 +      vitamin_d_binary:diabetes"

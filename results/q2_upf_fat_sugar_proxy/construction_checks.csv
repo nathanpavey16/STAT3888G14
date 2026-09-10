@@ -1,0 +1,14 @@
+check,value
+source_rows,12153
+output_rows,12153
+duplicate_output_ids,0
+id_order_preserved,TRUE
+available_proxy,12149
+missing_proxy,4
+zero_energy_source_rows,4
+positive_energy_but_invalid_proxy,0
+source_md5_before,7ea69c87bee9030371281562fc9e9a02
+source_md5_after,7ea69c87bee9030371281562fc9e9a02
+synthetic_tests,PASS
+rds_round_trip,PASS
+csv_round_trip,PASS

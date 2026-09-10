@@ -1,0 +1,5 @@
+test,F_statistic,numerator_df,denominator_df,p_value
+"Vitamin D: age/sex adjusted",4.13204879541251,2,52,0.0216053762552531
+"Nutrient proxy: age/sex adjusted",20.4290598037447,1,53,3.50601545477063e-05
+"Primary diabetes interaction: PR scale",1.72909060336676,1,51,0.194409241294654
+"Secondary diabetes interaction: OR scale",1.59286517861177,1,51,0.212658550559685

@@ -1,0 +1,13 @@
+name: stat3888g14
+channels:
+  - conda-forge
+dependencies:
+  - r-base=4.4
+  - r-rmarkdown
+  - r-data.table
+  - r-dplyr>=1.1
+  - r-survey
+  - r-ggplot2
+  - r-knitr
+  - r-readxl
+  - pandoc
