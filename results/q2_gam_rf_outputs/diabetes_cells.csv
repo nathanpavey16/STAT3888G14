@@ -1,0 +1,5 @@
+diabetes,vitamin_d_binary,n,obese_n,not_obese_n
+No diabetes,Adequate,1946,491,1455
+Diabetes,Adequate,66,44,22
+No diabetes,Deficient,572,166,406
+Diabetes,Deficient,32,16,16

@@ -1,0 +1,1980 @@
+---
+title: "Vitamin D, nutrient proxy and obesity"
+subtitle: "GLM, GAM and random-forest comparison"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: hide
+    code_download: true
+    self_contained: true
+    theme: default
+params:
+  data_dir: "../data/raw"
+  output_dir: "../results/q2_gam_rf_outputs"
+  seed: 3888
+  cv_repeats: 2
+  rf_trees: 500
+  export_results: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE,message=FALSE,warning=TRUE,
+  fig.width=10,fig.height=4.4,dpi=150,fig.align="center")
+required <- c("rmarkdown","data.table","survey","mgcv","ranger","ggplot2","knitr")
+missing <- setdiff(required,rownames(installed.packages()))
+if(length(missing)) stop("Install required R packages: ",paste(missing,collapse=", "))
+library(ggplot2)
+library(knitr)
+theme_set(theme_minimal(base_size=12)+theme(panel.grid.minor=element_blank(),
+  legend.position="top",plot.title.position="plot",plot.caption=element_text(hjust=0),
+  plot.margin=margin(6,22,6,6)))
+options(knitr.kable.NA="Not available",knitr.table.format="html")
+if(!rmarkdown::pandoc_available()) stop("Install Pandoc (included with RStudio).")
+```
+
+```{r analysis-functions, include=FALSE}
+# Q2 association and prediction analysis. No source file is modified.
+# All analysis functions are included directly in this R Markdown document.
+
+q2_make_proxy <- function(fat1, sugar1, energy1, recall1,
+                          fat2, sugar2, energy2, recall2) {
+  stopifnot(length(unique(lengths(list(fat1,sugar1,energy1,recall1,
+    fat2,sugar2,energy2,recall2))))==1L)
+  daily <- function(fat, sugar, energy, recall) {
+    recorded <- recall %in% 1:7
+    positive_energy <- is.finite(energy) & energy>0
+    components <- is.finite(fat) & fat>=0 & fat<=100 &
+      is.finite(sugar) & sugar>=0 & sugar<=100 & fat+sugar<=100
+    valid <- recorded & positive_energy & components
+    list(valid=valid, value=ifelse(valid,fat+sugar,NA_real_),
+      status=ifelse(!recorded,"No recorded recall",
+        ifelse(!positive_energy,"No positive energy",
+          ifelse(!components,"Invalid nutrient percentages","Valid"))))
+  }
+  first <- daily(fat1,sugar1,energy1,recall1)
+  second <- daily(fat2,sugar2,energy2,recall2)
+  # Day 1 is mandatory. An unavailable Day 2 never contributes a placeholder 0.
+  # This is an equal-day mean, NOT an energy-weighted pooled percentage.
+  # SATPER already includes trans fat; genuine nutrient zeros remain valid.
+  proxy <- ifelse(first$valid,
+    ifelse(second$valid,(first$value+second$value)/2,first$value),NA_real_)
+  data.frame(day1_valid=first$valid,day2_valid=second$valid,
+    proxy_day1_pct=first$value,proxy_day2_pct=second$value,
+    upf_nutrient_proxy_pct=proxy,upf_nutrient_proxy_pct10=proxy/10,
+    proxy_days=ifelse(first$valid,ifelse(second$valid,2L,1L),0L),
+    day2_status=second$status,
+    proxy_source=ifelse(!first$valid,"Unavailable: invalid Day 1",
+      ifelse(second$valid,"Mean of two valid days","Day 1 only")))
+}
+
+q2_read_data <- function(data_dir) {
+  paths <- file.path(data_dir, c("AHSnpa11bp.csv", "AHSnpa11bb.csv"))
+  stopifnot(all(file.exists(paths)))
+  before <- unname(tools::md5sum(paths))
+  reps <- sprintf("RPWGT%02d", 1:60)
+  p <- as.data.frame(data.table::fread(paths[1], select=c("ABSPID", "ABSHID",
+    "AGEC", "SEX", "FEMLSBC", "BMICATHY", "ENERGYF1", "ENERGYF2",
+    "SATPER1", "SATPER2", "PEADDSD1", "PEADDSD2", "NUTDAY1", "NUTDAY2")))
+  b <- as.data.frame(data.table::fread(paths[2], select=c("ABSPID", "VDLCMRGT",
+    "VDLCMREB", "DIABPRVE", "NHMSPERW", reps)))
+  stopifnot(!anyNA(p$ABSPID), !anyNA(b$ABSPID), !anyDuplicated(p$ABSPID),
+    !anyDuplicated(b$ABSPID), setequal(p$ABSPID, b$ABSPID))
+  d <- cbind(p, b[match(p$ABSPID, b$ABSPID), setdiff(names(b), "ABSPID")])
+  d$source_row_id <- seq_len(nrow(d))
+  d$household_id <- as.character(d$ABSHID)
+  stopifnot(!anyNA(d$household_id), all(nzchar(d$household_id)))
+  d$age <- d$AGEC
+  d$sex <- factor(ifelse(d$SEX %in% 1:2, d$SEX, NA), 1:2, c("Male", "Female"))
+  d$pregnancy <- ifelse(d$SEX == 1, "Not pregnant",
+    ifelse(d$SEX == 2 & d$FEMLSBC == 2, "Pregnant",
+      ifelse(d$SEX == 2 & d$FEMLSBC %in% c(1, 3:6), "Not pregnant", "Unknown")))
+  d$eligible <- d$age %in% 18:64 & d$pregnancy == "Not pregnant"
+  d$obese <- ifelse(d$BMICATHY %in% 7:9, 1L,
+    ifelse(d$BMICATHY %in% 1:6, 0L, NA_integer_))
+  d$vitamin_d <- factor(ifelse(d$VDLCMRGT %in% 1:3, d$VDLCMRGT, NA), 1:3,
+    c("Adequate", "Mild deficiency", "Moderate/severe deficiency"))
+  d$vitamin_d_binary <- factor(ifelse(d$VDLCMRGT == 1, "Adequate",
+    ifelse(d$VDLCMRGT %in% 2:3, "Deficient", NA)), c("Adequate", "Deficient"))
+  d$diabetes <- factor(ifelse(d$DIABPRVE %in% 1:2, "Diabetes",
+    ifelse(d$DIABPRVE %in% 3:4, "No diabetes", NA)), c("No diabetes", "Diabetes"))
+  d <- cbind(d,q2_make_proxy(d$SATPER1,d$PEADDSD1,d$ENERGYF1,d$NUTDAY1,
+    d$SATPER2,d$PEADDSD2,d$ENERGYF2,d$NUTDAY2))
+  d$weight <- d$NHMSPERW
+  d$weight_ok <- is.finite(d$weight) & d$weight > 0
+  base_vars <- c("obese", "vitamin_d", "age", "sex")
+  d$exposure_complete <- d$eligible & d$weight_ok &
+    complete.cases(d[, c(base_vars, "upf_nutrient_proxy_pct10")])
+  d$main_complete <- d$exposure_complete & !is.na(d$diabetes)
+  # All main model comparisons and the secondary interaction use one sample.
+  d$interaction_complete <- d$main_complete
+  d$joint_complete <- d$main_complete
+  d$two_day_complete <- d$main_complete & d$proxy_days==2L
+  stopifnot(nrow(d)==nrow(p), identical(d$ABSPID, p$ABSPID),
+    identical(before, unname(tools::md5sum(paths))))
+  flow <- data.frame(stage=c("All source participants", "Aged 18-64",
+    "Known non-pregnant, aged 18-64", "Measured BMI category available",
+    "Vitamin D, combined proxy, age, sex and positive biomedical weight",
+    "Diabetes also available: final common analysis sample"),
+    n=c(nrow(d), sum(d$age %in% 18:64), sum(d$eligible),
+      sum(d$eligible & !is.na(d$obese)), sum(d$exposure_complete), sum(d$main_complete)))
+  flow$excluded_at_step <- c(0, -diff(flow$n))
+  e <- d[d$eligible, ]
+  missing <- data.frame(variable=c("Measured obesity", "Blood vitamin D",
+    "Combined nutrient proxy", "Usable Day 2 (optional)", "Diabetes",
+    "Positive biomedical weight"), missing_n=c(sum(is.na(e$obese)),
+    sum(is.na(e$vitamin_d)), sum(is.na(e$upf_nutrient_proxy_pct10)), sum(!e$day2_valid),
+    sum(is.na(e$diabetes)), sum(!e$weight_ok)))
+  missing$eligible_n <- nrow(e)
+  missing$missing_pct <- 100*missing$missing_n/nrow(e)
+  pregnancy <- do.call(rbind, lapply(c("Not pregnant", "Pregnant", "Unknown"), function(z) {
+    x <- d[d$age %in% 18:64 & d$pregnancy == z, ]
+    data.frame(pregnancy=z, n=nrow(x), measured_bmi_n=sum(!is.na(x$obese)))
+  }))
+  availability <- do.call(rbind,lapply(c("All source participants",
+    "Eligible non-pregnant adults", "Main Q2 sample"),function(label) {
+    x <- switch(label,"All source participants"=d,
+      "Eligible non-pregnant adults"=e,"Main Q2 sample"=d[d$main_complete,])
+    data.frame(sample=label,n=nrow(x),both_days=sum(x$day1_valid & x$day2_valid),
+      day1_only=sum(x$day1_valid & !x$day2_valid),
+      day2_only=sum(!x$day1_valid & x$day2_valid),neither=sum(!x$day1_valid & !x$day2_valid))
+  }))
+  list(data=d, paths=paths, hashes=before, reps=reps, flow=flow,
+    missingness=missing, pregnancy=pregnancy,proxy_availability=availability)
+}
+
+q2_design <- function(d, reps) {
+  full <- d[d$weight_ok, ]
+  rw <- as.matrix(full[, reps])
+  stopifnot(all(is.finite(rw)), all(rw>=0), ncol(rw)==60)
+  survey::svrepdesign(data=full, weights=~weight, repweights=rw,
+    combined.weights=TRUE, type="other", scale=59/60,
+    rscales=rep(1, 60), mse=TRUE)
+}
+
+q2_prevalence <- function(design, label) {
+  x <- survey::svymean(~obese, design)
+  p <- unname(coef(x)); se <- unname(survey::SE(x))
+  df <- survey::degf(design)
+  ci <- plogis(qlogis(p)+c(-1,1)*qt(.975, df)*se/(p*(1-p)))
+  d <- design$variables
+  data.frame(analysis=label, n=nrow(d), obese_n=sum(d$obese),
+    not_obese_n=sum(d$obese==0), unweighted_pct=100*mean(d$obese),
+    weighted_pct=100*p, low=100*ci[1], high=100*ci[2], df=df)
+}
+
+q2_term_test <- function(model, term, label) {
+  z <- survey::regTermTest(model, stats::as.formula(paste("~", term)), method="Wald")
+  data.frame(test=label, F=as.numeric(z$Ftest), numerator_df=z$df,
+    denominator_df=z$ddf, p_value=as.numeric(z$p))
+}
+
+q2_contrast <- function(model, L, label, exponentiate=TRUE) {
+  stopifnot(length(L)==length(coef(model)))
+  estimate <- sum(L*coef(model))
+  se <- sqrt(drop(t(L) %*% vcov(model) %*% L))
+  df <- model$df.residual
+  ci <- estimate+c(-1, 1)*qt(.975, df)*se
+  data.frame(contrast=label, estimate=if(exponentiate) exp(estimate) else estimate,
+    low=if(exponentiate) exp(ci[1]) else ci[1],
+    high=if(exponentiate) exp(ci[2]) else ci[2], log_estimate=estimate,
+    SE=se, df=df, p_value=2*pt(abs(estimate/se), df, lower.tail=FALSE))
+}
+
+q2_or_table <- function(model) {
+  terms <- names(coef(model))[-1]
+  do.call(rbind, lapply(terms, function(term) {
+    L <- setNames(rep(0, length(coef(model))), names(coef(model)))
+    L[term] <- if(term=="age") 10 else 1
+    label <- switch(term, upf_nutrient_proxy_pct10="Combined nutrient proxy: +10 energy percentage points",
+      age="Age: +10 years",
+      diabetesDiabetes="Diabetes versus no diabetes",
+      sexFemale="Female versus male", term)
+    q2_contrast(model, L, label)
+  }))
+}
+
+q2_rcs_nonlinear <- function(x, knots) {
+  # Harrell restricted cubic basis: explicit x belongs in the model separately.
+  # Four fixed knots yield TWO nonlinear columns, avoiding x + ns(x) aliasing.
+  stopifnot(length(knots)==4L, all(diff(knots)>0))
+  h <- function(z) pmax(z, 0)^3
+  a <- knots[3]; b <- knots[4]
+  sapply(knots[1:2], function(t) (h(x-t)-h(x-a)*(b-t)/(b-a)+
+    h(x-b)*(a-t)/(b-a))/(b-knots[1])^2)
+}
+
+q2_nonlinearity <- function(design) {
+  d <- design$variables
+  predictors <- c("upf_nutrient_proxy_pct10", "age")
+  knots <- lapply(d[predictors], quantile, probs=c(.05, .35, .65, .95), names=FALSE)
+  nonlinear <- character()
+  for(v in predictors) {
+    b <- q2_rcs_nonlinear(d[[v]], knots[[v]])
+    nm <- paste0(v, "_nl", 1:2)
+    design$variables[, nm] <- b
+    nonlinear <- c(nonlinear, nm)
+  }
+  f <- reformulate(c("diabetes", "vitamin_d", predictors, "sex", nonlinear), "obese")
+  mm <- model.matrix(f, design$variables)
+  stopifnot(qr(mm)$rank == ncol(mm))
+  model <- survey::svyglm(f, design=design, family=quasibinomial())
+  tests <- do.call(rbind, lapply(predictors, function(v)
+    q2_term_test(model, paste(paste0(v,"_nl",1:2), collapse=" + "),
+      paste("Nonlinearity:", v))))
+  tests$p_holm <- p.adjust(tests$p_value, "holm")
+  global <- q2_term_test(model, paste(nonlinear, collapse=" + "), "Any nonlinearity")
+  global$p_holm <- NA_real_
+  list(model=model, tests=rbind(global, tests), knots=do.call(rbind,
+    lapply(predictors, function(v) data.frame(variable=v, knot=1:4, value=knots[[v]]))))
+}
+
+q2_gam_formula <- function(interaction=FALSE, nutrients=TRUE, k=6) {
+  s <- mgcv::s
+  lhs <- if(interaction) "vitamin_d_binary * diabetes" else "diabetes + vitamin_d"
+  rhs <- c(lhs, if(nutrients) sprintf("s(upf_nutrient_proxy_pct10, k=%d, bs='cr')", k),
+    sprintf("s(age, k=%d, bs='cr')", k), "sex")
+  stats::as.formula(paste("obese ~", paste(rhs, collapse=" + ")), env=environment())
+}
+
+q2_gam_bundle <- function(d, reps, formula, k=6, label="GAM") {
+  numeric_vars <- intersect(c("upf_nutrient_proxy_pct10", "age"), all.vars(formula))
+  knots <- lapply(d[numeric_vars], quantile, probs=seq(0,1,length.out=k), names=FALSE)
+  stopifnot(all(vapply(knots, function(x) length(unique(x))==k, logical(1))))
+  fit <- function(w) {
+    fit_data <- d
+    fit_data$.fit_weight <- w/mean(w)
+    ans <- mgcv::gam(formula, data=fit_data, family=quasibinomial(),
+      weights=.fit_weight, method="REML", knots=knots, drop.unused.levels=FALSE)
+    stopifnot(isTRUE(ans$converged), all(is.finite(coef(ans))))
+    if(!is.null(ans$outer.info$conv) && ans$outer.info$conv!="full convergence")
+      stop("GAM smoothing optimisation failed: ", ans$outer.info$conv)
+    ans
+  }
+  full <- fit(d$weight)
+  beta <- matrix(NA_real_, nrow=length(coef(full)), ncol=60,
+    dimnames=list(names(coef(full)), reps))
+  for(r in seq_along(reps)) {
+    if(r %% 10 == 0) message(label, ": survey replicate ", r, "/60")
+    z <- fit(d[[reps[r]]])
+    stopifnot(identical(names(coef(z)), rownames(beta)))
+    # Identical data, fixed knots and basis dimension preserve coefficient basis.
+    check_rows <- seq_len(min(8, nrow(d)))
+    stopifnot(max(abs(predict(full, d[check_rows,], type="lpmatrix") -
+      predict(z, d[check_rows,], type="lpmatrix"))) < 1e-8)
+    beta[,r] <- coef(z)
+  }
+  stopifnot(all(is.finite(beta)))
+  list(model=full, coefficients=cbind(full=coef(full), beta),
+    weights=cbind(full=d$weight, as.matrix(d[,reps])), kind="gam")
+}
+
+q2_logit_bundle <- function(model, d, reps) {
+  beta <- t(as.matrix(model$replicates))
+  stopifnot(nrow(beta)==length(coef(model)), ncol(beta)==60,
+    all(is.finite(beta)))
+  # survey versions may omit replicate coefficient names. In that case verify
+  # the model-matrix order and independently refit one replicate before naming.
+  if(is.null(rownames(beta))) {
+    stopifnot(identical(colnames(model.matrix(model)),names(coef(model))))
+    audit_data <- d
+    audit_data$.q2_rep_weight <- d[[reps[1]]]/mean(d[[reps[1]]])
+    audit <- glm(formula(model),data=audit_data,weights=.q2_rep_weight,
+      family=quasibinomial(),start=coef(model))
+    stopifnot(max(abs(unname(coef(audit))-beta[,1])) < 1e-5)
+    rownames(beta) <- names(coef(model))
+  }
+  stopifnot(setequal(rownames(beta),names(coef(model))))
+  beta <- beta[names(coef(model)),,drop=FALSE]
+  list(model=model, coefficients=cbind(full=coef(model), beta),
+    weights=cbind(full=d$weight, as.matrix(d[,reps])), kind="glm")
+}
+
+q2_standardise <- function(bundle, d, scenarios) {
+  # Each column uses its own replicate's model AND averaging weights.
+  vapply(scenarios, function(changes) {
+    nd <- d
+    for(v in names(changes)) {
+      nd[[v]] <- if(is.factor(d[[v]])) factor(rep(changes[[v]],nrow(d)),
+        levels=levels(d[[v]])) else rep(changes[[v]], nrow(d))
+    }
+    X <- if(bundle$kind=="gam") predict(bundle$model, nd, type="lpmatrix") else
+      model.matrix(delete.response(terms(bundle$model)), nd,
+        contrasts.arg=bundle$model$contrasts, xlev=bundle$model$xlevels)
+    X <- X[, rownames(bundle$coefficients), drop=FALSE]
+    pp <- plogis(X %*% bundle$coefficients)
+    colSums(pp*bundle$weights)/colSums(bundle$weights)
+  }, numeric(61))
+}
+
+q2_replicate_ci <- function(estimates, df, transform=c("identity", "logit")) {
+  transform <- match.arg(transform)
+  if(is.null(dim(estimates))) estimates <- matrix(estimates, ncol=1)
+  stopifnot(nrow(estimates)==61L, all(is.finite(estimates)))
+  if(transform=="logit" && any(estimates<=0 | estimates>=1))
+    stop("A probability CI is on the boundary; combine sparse display groups rather than clipping.")
+  z <- if(transform=="logit") qlogis(estimates) else estimates
+  se <- sqrt((59/60)*colSums(sweep(z[-1,,drop=FALSE],2,z[1,],"-")^2))
+  stopifnot(all(is.finite(z)),all(is.finite(se)))
+  lo <- z[1,]-qt(.975,df)*se; hi <- z[1,]+qt(.975,df)*se
+  data.frame(estimate=estimates[1,], low=if(transform=="logit") plogis(lo) else lo,
+    high=if(transform=="logit") plogis(hi) else hi, SE_transformed=se, df=df)
+}
+
+q2_main_curves <- function(d, linear, gam, df) {
+  specs <- list(); meta <- list()
+  for(v in c("upf_nutrient_proxy_pct10", "age")) {
+    grid <- seq(quantile(d[[v]],.05), quantile(d[[v]],.95), length.out=25)
+    for(x in grid) {
+      specs[[length(specs)+1]] <- setNames(list(x),v)
+      meta[[length(meta)+1]] <- data.frame(variable=v, value=x)
+    }
+  }
+  meta <- do.call(rbind, meta)
+  curves <- do.call(rbind,lapply(c("Logistic", "GAM"),function(name) {
+    est <- q2_standardise(if(name=="GAM") gam else linear,d,specs)
+    cbind(model=name,meta,q2_replicate_ci(est,df,"logit"))
+  }))
+  curves$value <- ifelse(curves$variable=="age",curves$value,curves$value*10)
+  vd <- lapply(levels(d$vitamin_d), function(z) list(vitamin_d=z))
+  vitamin <- do.call(rbind,lapply(c("Logistic", "GAM"),function(name) {
+    est <- q2_standardise(if(name=="GAM") gam else linear,d,vd)
+    cbind(model=name,vitamin_d=levels(d$vitamin_d),q2_replicate_ci(est,df,"logit"))
+  }))
+  list(curves=curves, vitamin=vitamin)
+}
+
+q2_diabetes_results <- function(design, joint_design, reps) {
+  d <- design$variables
+  formula <- obese ~ vitamin_d_binary * diabetes + upf_nutrient_proxy_pct10 + age + sex
+  primary <- survey::svyglm(formula,design=design,family=quasibinomial(),return.replicates=TRUE)
+  primary_bundle <- q2_logit_bundle(primary,d,reps)
+  gam <- q2_gam_bundle(d,reps,q2_gam_formula(TRUE,TRUE),label="Diabetes GAM")
+  tests <- q2_term_test(primary,"vitamin_d_binary:diabetes","Proxy-adjusted logistic interaction")
+  # A model-based GAM coefficient is tested with survey-replicate covariance.
+  nm <- grep(":",rownames(gam$coefficients),value=TRUE)
+  stopifnot(length(nm)==1L)
+  z <- gam$coefficients[nm,]
+  se <- sqrt((59/60)*sum((z[-1]-z[1])^2))
+  df <- survey::degf(design)
+  gam_test <- data.frame(test="GAM interaction (replicate-based, approximate)",
+    F=(z[1]/se)^2,numerator_df=1,denominator_df=df,
+    p_value=pf((z[1]/se)^2,1,df,lower.tail=FALSE))
+  tests <- rbind(tests,gam_test)
+  terms <- names(coef(primary))
+  vdterm <- "vitamin_d_binaryDeficient"
+  interterm <- grep(":",terms,value=TRUE)
+  contrasts <- lapply(c("No diabetes", "Diabetes", "Ratio of odds ratios"),function(g) {
+    L <- setNames(rep(0,length(terms)),terms)
+    if(g!="Ratio of odds ratios") L[vdterm] <- 1
+    if(g!="No diabetes") L[interterm] <- 1
+    q2_contrast(primary,L,g)
+  })
+  combos <- expand.grid(vitamin_d_binary=c("Adequate","Deficient"),
+    diabetes=c("No diabetes","Diabetes"),stringsAsFactors=FALSE)
+  scenarios <- lapply(seq_len(nrow(combos)),function(i) as.list(combos[i,]))
+  probs <- list(Logistic=q2_standardise(primary_bundle,d,scenarios),
+    GAM=q2_standardise(gam,d,scenarios))
+  prevalences <- do.call(rbind,lapply(names(probs),function(m)
+    cbind(model=m,combos,q2_replicate_ci(probs[[m]],df,"logit"))))
+  differences <- do.call(rbind,lapply(names(probs),function(m) {
+    x <- probs[[m]]
+    est <- cbind(x[,2]-x[,1],x[,4]-x[,3],(x[,4]-x[,3])-(x[,2]-x[,1]))
+    cbind(model=m,contrast=c("Deficient - adequate: no diabetes",
+      "Deficient - adequate: diabetes", "Difference in prevalence differences"),
+      q2_replicate_ci(est,df,"identity"))
+  }))
+  cells <- aggregate(cbind(n=rep(1,nrow(d)),obese_n=d$obese),
+    d[c("diabetes","vitamin_d_binary")],sum)
+  cells$not_obese_n <- cells$n-cells$obese_n
+  stopifnot(identical(d$source_row_id,joint_design$variables$source_row_id))
+  matched <- survey::svyglm(update(formula,.~.-upf_nutrient_proxy_pct10),
+    design=joint_design,family=quasibinomial())
+  sensitivity <- rbind(q2_term_test(matched,"vitamin_d_binary:diabetes",
+    "Same sample, no-proxy sensitivity"),q2_term_test(primary,"vitamin_d_binary:diabetes",
+    "Same sample, primary proxy-adjusted model"))
+  list(primary=primary,gam=gam,tests=tests,odds=do.call(rbind,contrasts),
+    prevalences=prevalences,differences=differences,cells=cells,sensitivity=sensitivity)
+}
+
+q2_compute_associations <- function(data_dir) {
+  input <- q2_read_data(data_dir)
+  full <- q2_design(input$data,input$reps)
+  main <- subset(full,main_complete)
+  subgroup <- subset(full,interaction_complete)
+  joint <- subset(full,joint_complete)
+  d <- main$variables
+  model <- survey::svyglm(obese ~ diabetes+vitamin_d+upf_nutrient_proxy_pct10+age+sex,
+    design=main,family=quasibinomial(),return.replicates=TRUE)
+  stopifnot(model$converged,all(is.finite(coef(model))))
+  tests <- do.call(rbind,lapply(c("vitamin_d","upf_nutrient_proxy_pct10"),function(v)
+    q2_term_test(model,v,paste("Adjusted association:",v))))
+  tests$p_holm <- p.adjust(tests$p_value,"holm")
+  linear <- q2_logit_bundle(model,d,input$reps)
+  nonlinear <- q2_nonlinearity(main)
+  gam <- q2_gam_bundle(d,input$reps,q2_gam_formula(),label="Main GAM")
+  display <- q2_main_curves(d,linear,gam,survey::degf(main))
+  interaction <- q2_diabetes_results(subgroup,joint,input$reps)
+  samples <- rbind(q2_prevalence(main,"Diabetes-adjusted association and prediction"),
+    q2_prevalence(subgroup,"Proxy-adjusted diabetes interaction"),
+    q2_prevalence(joint,"Same-sample no-proxy interaction sensitivity"),
+    q2_prevalence(subset(full,two_day_complete),"Two-valid-day sensitivity"))
+  two_day_design <- subset(full,two_day_complete)
+  two_day_model <- survey::svyglm(formula(model),design=two_day_design,family=quasibinomial())
+  stopifnot(two_day_model$converged,all(is.finite(coef(two_day_model))))
+  sensitivity_odds <- do.call(rbind,lapply(c("Main: Day 1 fallback","Two valid days only"),function(label) {
+    fit <- if(label=="Main: Day 1 fallback") model else two_day_model
+    rows <- q2_or_table(fit)
+    rows <- rows[grepl("^vitamin_d|^Combined nutrient",rows$contrast),]
+    cbind(analysis=label,n=if(label=="Main: Day 1 fallback") nrow(d) else nrow(two_day_design$variables),rows)
+  }))
+  proxy_usage <- as.data.frame(table(source=d$proxy_source),stringsAsFactors=FALSE)
+  names(proxy_usage)[2] <- "n"
+  proxy_usage$percent <- 100*proxy_usage$n/nrow(d)
+  fallback_reasons <- as.data.frame(table(reason=d$day2_status[d$proxy_days==1L]),stringsAsFactors=FALSE)
+  names(fallback_reasons)[2] <- "n"
+  detail <- summary(gam$model)$s.table
+  smooths <- data.frame(term=rownames(detail),edf=detail[,"edf"],row.names=NULL)
+  set.seed(3888)
+  kc <- mgcv::k.check(gam$model,n.rep=200)
+  diagnostics <- data.frame(term=rownames(kc),basis_dimension=kc[,1],edf=kc[,2],
+    k_index=kc[,3],row.names=NULL) # no ordinary iid p-values reported
+  conc <- mgcv::concurvity(gam$model,full=TRUE)
+  concurvity <- data.frame(term=colnames(conc),worst=conc["worst",],
+    observed=conc["observed",],estimate=conc["estimate",],row.names=NULL)
+  summary_numeric <- do.call(rbind,lapply(c("upf_nutrient_proxy_pct","age"),function(v)
+    data.frame(variable=v,n=nrow(d),mean=mean(d[[v]]),sd=sd(d[[v]]),
+      p05=quantile(d[[v]],.05),median=median(d[[v]]),p95=quantile(d[[v]],.95))))
+  list(input=input,main_data=d,main_design=main,model=model,association_tests=tests,
+    odds=q2_or_table(model),nonlinearity=nonlinear,gam=gam,curves=display$curves,
+    vitamin=display$vitamin,interaction=interaction,samples=samples,smooths=smooths,
+    diagnostics=diagnostics,concurvity=concurvity,numeric_summary=summary_numeric,
+    correlation=cor(d[c("upf_nutrient_proxy_pct10","age")]),
+    proxy_usage=proxy_usage,proxy_fallback_reasons=fallback_reasons,
+    proxy_sensitivity=sensitivity_odds,
+    household_n=length(unique(d$household_id)))
+}
+
+q2_prediction_summary <- function(prediction, d, reps, df) {
+  # Fixed out-of-fold predictions, reweighted by survey replicates.
+  # These CIs omit training/tuning/fold-assignment uncertainty; do not use them
+  # as definitive model-superiority tests or treat folds as independent samples.
+  o <- prediction$oof
+  model_columns <- c(Logistic="p_logistic",GAM="p_gam",RF="p_rf",Null="p_null")
+  stopifnot(all(unname(model_columns) %in% names(o)))
+  index <- match(o$source_row_id,d$source_row_id)
+  stopifnot(!anyNA(index))
+  wmat <- cbind(full=d$weight,as.matrix(d[,reps]))[index,,drop=FALSE]
+  repetition <- if("repeat_id" %in% names(o)) o$repeat_id else o$repetition
+  stopifnot(length(repetition)==nrow(o))
+  estimates <- list(); tables <- list()
+  for(m in names(model_columns)) {
+    pp <- o[[model_columns[[m]]]]
+    calc <- function(w) Reduce("+",lapply(unique(repetition),function(r) {
+      use <- repetition==r
+      weighted_binary_metrics(o$obese[use],pp[use],w[use])
+    }))/length(unique(repetition))
+    est <- vapply(seq_len(ncol(wmat)),function(j) calc(wmat[,j]),
+      calc(wmat[,1]))
+    estimates[[m]] <- t(est)
+    ci <- q2_replicate_ci(t(est),df)
+    tables[[m]] <- cbind(model=m,metric=rownames(est),ci)
+  }
+  comparison <- do.call(rbind,lapply(c("GAM","RF"),function(m) {
+    x <- estimates[[m]]-estimates$Logistic
+    cbind(comparison=paste(m,"minus Logistic"),metric=colnames(x),
+      q2_replicate_ci(x,df))
+  }))
+  # Weighted calibration by pooled OOF risk bins; each repeat is equally represented.
+  # This is not a calibrated/retrained model and is not an average-prediction ensemble.
+  calibration <- do.call(rbind,lapply(names(model_columns)[1:3],function(m) {
+    pp <- o[[model_columns[[m]]]]
+    cuts <- unique(as.numeric(quantile(pp,seq(0,1,.1))))
+    bin <- cut(pp,breaks=cuts,include.lowest=TRUE)
+    do.call(rbind,lapply(levels(bin),function(g) {
+      use <- bin==g
+      weights <- wmat[use,1]
+      obs <- colSums(wmat[use,,drop=FALSE]*o$obese[use])/colSums(wmat[use,,drop=FALSE])
+      ci <- q2_replicate_ci(obs,df,"logit")
+      data.frame(model=m,bin=g,n_predictions=sum(use),
+        predicted=weighted.mean(pp[use],weights),observed=ci$estimate,
+        low=ci$low,high=ci$high)
+    }))
+  }))
+  list(metrics=do.call(rbind,tables),differences=comparison,calibration=calibration)
+}
+
+q2_export_results <- function(result, output_dir) {
+  dir.create(output_dir,recursive=TRUE,showWarnings=FALSE)
+  tables <- list(sample_flow=result$input$flow,analysis_samples=result$samples,
+    missingness=result$input$missingness,pregnancy_audit=result$input$pregnancy,
+    proxy_availability=result$input$proxy_availability,proxy_usage=result$proxy_usage,
+    proxy_fallback_reasons=result$proxy_fallback_reasons,
+    proxy_two_day_sensitivity=result$proxy_sensitivity,
+    numeric_summary=result$numeric_summary,adjusted_odds_ratios=result$odds,
+    association_tests=result$association_tests,nonlinearity_tests=result$nonlinearity$tests,
+    spline_knots=result$nonlinearity$knots,gam_smooth_complexity=result$smooths,
+    gam_diagnostics=result$diagnostics,gam_concurvity=result$concurvity,
+    adjusted_nutrient_age_curves=result$curves,adjusted_vitamin_d_prevalence=result$vitamin,
+    diabetes_cells=result$interaction$cells,diabetes_tests=result$interaction$tests,
+    diabetes_odds_ratios=result$interaction$odds,
+    diabetes_adjusted_prevalence=result$interaction$prevalences,
+    diabetes_prevalence_differences=result$interaction$differences,
+    diabetes_nutrient_sensitivity=result$interaction$sensitivity,
+    prediction_metrics=result$prediction_summary$metrics,
+    prediction_differences=result$prediction_summary$differences,
+    calibration=result$prediction_summary$calibration,
+    cv_fold_metrics=result$prediction$fold_metrics,cv_tuning=result$prediction$tuning,
+    cv_fold_audit=result$prediction$fold_audit)
+  for(nm in names(tables)) data.table::fwrite(tables[[nm]],file.path(output_dir,paste0(nm,".csv")))
+  # Only aggregate tables are exported; no survey identifiers/OOF individual records.
+  checksums <- data.frame(file=basename(result$input$paths),md5=result$input$hashes)
+  data.table::fwrite(checksums,file.path(output_dir,"source_checksums.csv"))
+  writeLines(capture.output(sessionInfo()),file.path(output_dir,"session_info.txt"))
+  stopifnot(identical(result$input$hashes,unname(tools::md5sum(result$input$paths))))
+  invisible(tables)
+}
+```
+
+```{r prediction-functions, include=FALSE}
+# Q2: leakage-safe predictive comparison of logistic regression, GAM and RF.
+#
+# This block defines functions only; defining them does not fit a model or write a
+# file. The caller supplies a cleaned, complete-case person-level data.frame.
+# Participant-level out-of-fold predictions remain in memory. Export only
+# aggregate tables/figures from the calling report.
+#
+# Required columns:
+# source_row_id (unique), household_id, obese (numeric 0/1), diabetes (factor),
+# vitamin_d (factor), upf_nutrient_proxy_pct10, age, sex (factor), weight (>0). The nutrient proxy
+# is the mean of two valid daily SATPER + PEADDSD sums, requiring valid Day 1;
+# otherwise valid Day 1 alone is used. Divide by 10. The RPWGT columns may be
+# present but are deliberately NOT model predictors.
+#
+# All three models receive EXACTLY the same predictors and outer test rows.
+# Hyperparameter selection uses weighted Brier loss in inner grouped folds.
+# For each outer training set, weights are divided by their mean. This retains
+# relative survey weights but avoids making the population total act like an
+# enormous training sample in GAM penalisation. Predictive fitting here does
+# NOT produce survey-design-adjusted coefficient tests or confidence intervals.
+# In ranger, case.weights control the probability of sampling a person into a
+# tree; they are not a complete implementation of survey-design inference.
+
+weighted_binary_metrics <- function(y, p, w) {
+  if (!is.numeric(y) || !is.numeric(p) || !is.numeric(w) ||
+      length(y) != length(p) || length(y) != length(w) || length(y) == 0L) {
+    stop("y, p and w must be non-empty numeric vectors of equal length.")
+  }
+  if (anyNA(y) || anyNA(p) || anyNA(w) ||
+      any(!is.finite(y)) || any(!is.finite(p)) || any(!is.finite(w)) ||
+      any(!y %in% c(0, 1)) || any(w < 0) || sum(w) <= 0 ||
+      any(p < -1e-12 | p > 1 + 1e-12)) {
+    stop("Metrics require binary outcomes, finite probabilities and valid weights.")
+  }
+  p <- pmin(1, pmax(0, p))
+  positive_weight <- sum(w[y == 1])
+  negative_weight <- sum(w[y == 0])
+
+  # Weighted AUC = weighted probability that an obese person receives a higher
+  # score than a non-obese person, with half credit for equal predicted scores.
+  # Aggregating each distinct score makes tie handling exact, not order-dependent.
+  ord <- order(p)
+  score_group <- cumsum(c(TRUE, diff(p[ord]) != 0))
+  grouped <- rowsum(
+    cbind(positive = w[ord] * y[ord], negative = w[ord] * (1 - y[ord])),
+    group = score_group, reorder = FALSE
+  )
+  controls_below <- cumsum(grouped[, "negative"]) - grouped[, "negative"]
+  auc <- if (positive_weight > 0 && negative_weight > 0) {
+    sum(grouped[, "positive"] *
+          (controls_below + 0.5 * grouped[, "negative"])) /
+      (positive_weight * negative_weight)
+  } else {
+    NA_real_
+  }
+
+  # Clipping is used only to keep log loss finite at numerical 0/1 predictions.
+  safe_p <- pmin(1 - 1e-15, pmax(1e-15, p))
+  predicted_class <- p >= 0.5
+  c(
+    auc = auc,
+    brier = sum(w * (y - p)^2) / sum(w),
+    log_loss = -sum(w * (y * log(safe_p) + (1 - y) * log1p(-safe_p))) / sum(w),
+    sensitivity_0_5 = if (positive_weight > 0) {
+      sum(w * (y == 1) * predicted_class) / positive_weight
+    } else NA_real_,
+    specificity_0_5 = if (negative_weight > 0) {
+      sum(w * (y == 0) * (!predicted_class)) / negative_weight
+    } else NA_real_,
+    observed_prevalence = sum(w * y) / sum(w),
+    mean_predicted_probability = sum(w * p) / sum(w)
+  )
+}
+
+q2_prediction_self_test <- function() {
+  # Small known answers validate unequal weights, ties and score direction.
+  eq <- function(actual, expected) {
+    isTRUE(all.equal(unname(actual), expected, tolerance = 1e-12))
+  }
+  stopifnot(
+    eq(weighted_binary_metrics(c(0, 1), c(0.1, 0.9), c(2, 3))["auc"], 1),
+    eq(weighted_binary_metrics(c(0, 1), c(0.9, 0.1), c(2, 3))["auc"], 0),
+    eq(weighted_binary_metrics(c(0, 1), c(0.4, 0.4), c(2, 3))["auc"], 0.5),
+    eq(weighted_binary_metrics(c(0, 1), c(0.5, 0.5), c(2, 3))["brier"], 0.25),
+    eq(weighted_binary_metrics(c(0, 1), c(0.5, 0.5), c(2, 3))["log_loss"], log(2)),
+    # First positive (weight 2) ties the first negative (weight 1) and loses to
+    # the second (weight 3); second positive (weight 4) beats both negatives.
+    eq(weighted_binary_metrics(c(0, 1, 0, 1), c(0.2, 0.2, 0.7, 0.9),
+                               c(1, 2, 3, 4))["auc"], 17 / 24)
+  )
+  invisible(TRUE)
+}
+
+q2_prediction_seed <- function(seed, offset = 0) {
+  as.integer((as.double(seed) + as.double(offset)) %% 2147483646 + 1)
+}
+
+q2_validate_prediction_data <- function(d) {
+  required <- c("source_row_id", "household_id", "obese", "diabetes", "vitamin_d",
+                "upf_nutrient_proxy_pct10", "age", "sex", "weight")
+  if (!is.data.frame(d) || !all(required %in% names(d))) {
+    stop("Prediction data are missing required columns: ",
+         paste(setdiff(required, names(d)), collapse = ", "))
+  }
+  if (nrow(d) == 0L || anyNA(d[, required, drop = FALSE]) ||
+      anyDuplicated(d$source_row_id) ||
+      any(!nzchar(trimws(as.character(d$household_id))))) {
+    stop("Prediction data must be complete with unique row IDs and known households.")
+  }
+  numeric_cols <- c("obese", "upf_nutrient_proxy_pct10", "age", "weight")
+  if (!all(vapply(d[numeric_cols], is.numeric, logical(1))) ||
+      any(!is.finite(as.matrix(d[numeric_cols]))) ||
+      any(!d$obese %in% c(0, 1)) || any(d$weight <= 0)) {
+    stop("Invalid numeric predictors, outcome or positive analysis weights.")
+  }
+  if (!is.factor(d$diabetes) || nlevels(d$diabetes) != 2L ||
+      !is.factor(d$vitamin_d) || nlevels(d$vitamin_d) != 3L ||
+      !is.factor(d$sex) || nlevels(d$sex) != 2L) {
+    stop("vitamin_d must have 3 factor levels; diabetes and sex must each have 2.")
+  }
+  if (any(table(d$diabetes) == 0) || any(table(d$vitamin_d) == 0) ||
+      any(table(d$sex) == 0) ||
+      length(unique(d$obese)) != 2L) {
+    stop("All predictor factor levels and both outcome values must be observed.")
+  }
+  invisible(TRUE)
+}
+
+q2_grouped_prediction_folds <- function(d, k, seed) {
+  # Allocate entire households, approximately balancing case and non-case
+  # counts. No nutrient value, vitamin D value or model prediction is used.
+  # Outcome stratification is only a resampling-design step, not preprocessing.
+  households <- unique(as.character(d$household_id))
+  if (length(households) < k) stop("Fewer households than requested folds.")
+  group <- match(as.character(d$household_id), households)
+  counts <- rowsum(cbind(non_obese = 1 - d$obese, obese = d$obese),
+                  group = group, reorder = FALSE)
+  # rowsum(reorder=FALSE) follows first occurrence, as does match()/unique().
+  stopifnot(nrow(counts) == length(households))
+  set.seed(seed)
+  group_order <- order(-rowSums(counts), runif(nrow(counts)))
+  totals <- matrix(0, nrow = k, ncol = 2L)
+  assigned <- integer(nrow(counts))
+  target <- pmax(colSums(counts) / k, 1)
+  initial_folds <- sample.int(k)
+
+  for (j in seq_along(group_order)) {
+    h <- group_order[j]
+    if (j <= k) {
+      selected <- initial_folds[j]
+    } else {
+      # Minimise the increase in normalised squared fold counts. This favours
+      # folds short of whichever outcome is present in the current household.
+      loss <- vapply(seq_len(k), function(f) {
+        sum(((totals[f, ] + counts[h, ]) / target)^2 -
+              (totals[f, ] / target)^2)
+      }, numeric(1))
+      ties <- which(abs(loss - min(loss)) < 1e-12)
+      selected <- ties[sample.int(length(ties), 1L)]
+    }
+    assigned[h] <- selected
+    totals[selected, ] <- totals[selected, ] + counts[h, ]
+  }
+  folds <- assigned[group]
+  if (any(tabulate(folds, nbins = k) == 0L)) stop("An empty fold was created.")
+  stopifnot(all(vapply(split(folds, d$household_id),
+                      function(x) length(unique(x)) == 1L, logical(1))))
+  folds
+}
+
+q2_prediction_split_audit <- function(train, test, repeat_id, outer_fold,
+                                      inner_fold = NA_integer_) {
+  overlap <- intersect(as.character(train$household_id), as.character(test$household_id))
+  if (length(overlap) > 0L) stop("Household leakage detected in resampling.")
+  if (length(unique(train$obese)) != 2L || length(unique(test$obese)) != 2L) {
+    stop("A training/validation fold lacks an outcome class; revise the fold design.")
+  }
+  for (variable in c("diabetes", "vitamin_d", "sex")) {
+    if (any(table(train[[variable]]) == 0)) {
+      stop("Training fold lacks a predictor factor level: ", variable)
+    }
+    stopifnot(identical(levels(train[[variable]]), levels(test[[variable]])))
+  }
+  data.frame(
+    stage = if (is.na(inner_fold)) "outer" else "inner",
+    repeat_id = repeat_id, outer_fold = outer_fold, inner_fold = inner_fold,
+    n_train = nrow(train), n_test = nrow(test),
+    households_train = length(unique(train$household_id)),
+    households_test = length(unique(test$household_id)),
+    households_shared = length(overlap),
+    obese_train = sum(train$obese), obese_test = sum(test$obese),
+    diabetes_train = sum(train$diabetes == levels(train$diabetes)[2L]),
+    diabetes_test = sum(test$diabetes == levels(test$diabetes)[2L]),
+    stringsAsFactors = FALSE
+  )
+}
+
+q2_fit_predict <- function(train, test, model, config = list(), trees = 500L,
+                          seed = 3888L) {
+  # Only this explicit predictor list is allowed. IDs, BMI components,
+  # raw nutrient/day values, fallback flags, survey weights and replicate
+  # weights can never be accidentally predictors.
+  predictors <- c("diabetes", "vitamin_d", "upf_nutrient_proxy_pct10", "age", "sex")
+  xtrain <- train[, c("obese", predictors), drop = FALSE]
+  xtest <- test[, predictors, drop = FALSE]
+  fit_weights <- train$weight / mean(train$weight)
+
+  p <- tryCatch({
+    if (identical(model, "logistic")) {
+      fitted <- stats::glm(
+        obese ~ diabetes + vitamin_d + upf_nutrient_proxy_pct10 + age + sex,
+        family = stats::quasibinomial(link = "logit"),
+        data = xtrain, weights = fit_weights,
+        control = stats::glm.control(maxit = 100)
+      )
+      if (!isTRUE(fitted$converged) || anyNA(stats::coef(fitted))) {
+        stop("Logistic model did not converge or has aliased coefficients.")
+      }
+      as.numeric(stats::predict(fitted, newdata = xtest, type = "response"))
+    } else if (identical(model, "gam")) {
+      k <- as.integer(config$k)
+      if (length(k) != 1L || !k %in% c(4L, 6L)) stop("Invalid GAM k.")
+      if (any(vapply(xtrain[c("upf_nutrient_proxy_pct10", "age")],
+                     function(x) length(unique(x)) < k, logical(1)))) {
+        stop("A numeric predictor has too few distinct values for the requested k.")
+      }
+      s <- mgcv::s
+      formula <- stats::as.formula(sprintf(
+        "obese ~ diabetes + vitamin_d + s(upf_nutrient_proxy_pct10, bs = 'cr', k = %d) + s(age, bs = 'cr', k = %d) + sex",
+        k, k
+      ), env = environment())
+      fitted <- mgcv::gam(
+        formula, data = xtrain, family = stats::quasibinomial(link = "logit"),
+        weights = fit_weights, method = "REML",
+        control = mgcv::gam.control(maxit = 100)
+      )
+      if (!isTRUE(fitted$converged) || anyNA(stats::coef(fitted))) {
+        stop("GAM did not converge or has missing coefficients.")
+      }
+      if (!is.null(fitted$outer.info$conv) &&
+          !identical(fitted$outer.info$conv, "full convergence")) {
+        stop("GAM smoothing optimisation did not fully converge: ", fitted$outer.info$conv)
+      }
+      as.numeric(stats::predict(fitted, newdata = xtest, type = "response"))
+    } else if (identical(model, "rf")) {
+      xtrain$obese <- factor(xtrain$obese, levels = c(0, 1),
+                             labels = c("Not obese", "Obese"))
+      fitted <- ranger::ranger(
+        obese ~ diabetes + vitamin_d + upf_nutrient_proxy_pct10 + age + sex,
+        data = xtrain, probability = TRUE,
+        num.trees = as.integer(trees), mtry = as.integer(config$mtry),
+        min.node.size = as.integer(config$min.node.size),
+        case.weights = fit_weights, respect.unordered.factors = "order",
+        num.threads = 1L, seed = seed, write.forest = TRUE,
+        importance = "none"
+      )
+      prediction <- stats::predict(fitted, data = xtest)$predictions
+      if (!is.matrix(prediction) || !"Obese" %in% colnames(prediction)) {
+        stop("RF probability output does not contain the Obese class.")
+      }
+      as.numeric(prediction[, "Obese"])
+    } else {
+      stop("Unknown prediction model: ", model)
+    }
+  }, error = function(e) {
+    stop(model, " fitting/prediction failed: ", conditionMessage(e), call. = FALSE)
+  })
+  if (length(p) != nrow(test) || anyNA(p) || any(!is.finite(p)) ||
+      any(p < 0 | p > 1)) {
+    stop(model, " returned invalid probabilities; no fallback has been substituted.")
+  }
+  p
+}
+
+run_prediction_comparison <- function(d, seed = 3888, outer_k = 5,
+                                      inner_k = 3, repeats = 2, trees = 500) {
+  for (pkg in c("mgcv", "ranger")) {
+    if (!requireNamespace(pkg, quietly = TRUE)) {
+      stop("Install the required R package before running this comparison: ", pkg)
+    }
+  }
+  integer_args <- c(outer_k, inner_k, repeats, trees)
+  if (any(!is.finite(integer_args)) || any(integer_args != as.integer(integer_args)) ||
+      outer_k < 2L || inner_k < 2L || repeats < 1L || trees < 1L ||
+      length(seed) != 1L || !is.finite(seed)) {
+    stop("Invalid seed, fold count, repeat count or tree count.")
+  }
+  q2_validate_prediction_data(d)
+  q2_prediction_self_test()
+
+  # Preserve the caller's random-number stream; every resampling/fitting seed
+  # is separately deterministic inside the comparison.
+  had_seed <- exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)
+  if (had_seed) previous_seed <- get(".Random.seed", envir = .GlobalEnv)
+  on.exit({
+    if (had_seed) {
+      assign(".Random.seed", previous_seed, envir = .GlobalEnv)
+    } else if (exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)) {
+      rm(list = ".Random.seed", envir = .GlobalEnv)
+    }
+  }, add = TRUE)
+
+  d <- d[order(d$source_row_id), , drop = FALSE]
+  rownames(d) <- NULL
+  gam_grid <- data.frame(k = c(4L, 6L))
+  # In exact Brier ties, the grid order favours fewer split candidates and a
+  # larger terminal-node size. Both grids are fixed before validation starts.
+  # Preserve the existing grid: with five predictors, mtry = 2 and 4 remain valid.
+  rf_grid <- expand.grid(mtry = c(2L, 4L), min.node.size = c(40L, 15L))
+  inner_trees <- min(as.integer(trees), 300L)
+  predictions <- list()
+  metrics <- list()
+  tuning <- list()
+  audits <- list()
+
+  for (r in seq_len(repeats)) {
+    outer_fold <- q2_grouped_prediction_folds(
+      d, outer_k, q2_prediction_seed(seed, r * 100000L)
+    )
+    for (f in seq_len(outer_k)) {
+      train <- d[outer_fold != f, , drop = FALSE]
+      test <- d[outer_fold == f, , drop = FALSE]
+      audits[[length(audits) + 1L]] <- q2_prediction_split_audit(train, test, r, f)
+      inner_fold <- q2_grouped_prediction_folds(
+        train, inner_k, q2_prediction_seed(seed, r * 100000L + f * 1000L)
+      )
+      for (j in seq_len(inner_k)) {
+        audits[[length(audits) + 1L]] <- q2_prediction_split_audit(
+          train[inner_fold != j, , drop = FALSE],
+          train[inner_fold == j, , drop = FALSE], r, f, j
+        )
+      }
+
+      selected <- list()
+      for (model in c("gam", "rf")) {
+        grid <- if (model == "gam") gam_grid else rf_grid
+        candidate_results <- vector("list", nrow(grid))
+        losses <- rep(NA_real_, nrow(grid))
+        for (g in seq_len(nrow(grid))) {
+          inner_p <- rep(NA_real_, nrow(train))
+          for (j in seq_len(inner_k)) {
+            validation_rows <- which(inner_fold == j)
+            inner_p[validation_rows] <- q2_fit_predict(
+              train = train[inner_fold != j, , drop = FALSE],
+              test = train[validation_rows, , drop = FALSE], model = model,
+              config = as.list(grid[g, , drop = FALSE]), trees = inner_trees,
+              seed = q2_prediction_seed(seed, r * 100000L + f * 1000L +
+                                           g * 10L + j + if (model == "rf") 500L else 0L)
+            )
+          }
+          if (anyNA(inner_p)) stop("Incomplete inner validation prediction coverage.")
+          score <- weighted_binary_metrics(train$obese, inner_p, train$weight)
+          losses[g] <- unname(score["brier"])
+          candidate_results[[g]] <- data.frame(
+            repeat_id = r, outer_fold = f, model = model, candidate = g,
+            k = if (model == "gam") grid$k[g] else NA_integer_,
+            mtry = if (model == "rf") grid$mtry[g] else NA_integer_,
+            min_node_size = if (model == "rf") grid$min.node.size[g] else NA_integer_,
+            inner_weighted_brier = unname(score["brier"]),
+            inner_weighted_auc = unname(score["auc"]),
+            inner_weighted_log_loss = unname(score["log_loss"]),
+            inner_folds = inner_k,
+            trees = if (model == "rf") inner_trees else NA_integer_,
+            selected = FALSE,
+            stringsAsFactors = FALSE
+          )
+        }
+        if (any(!is.finite(losses))) stop("A tuning loss is not finite.")
+        best <- which.min(losses)
+        selected[[model]] <- as.list(grid[best, , drop = FALSE])
+        candidate_results[[best]]$selected <- TRUE
+        tuning <- c(tuning, candidate_results)
+      }
+
+      # Nothing in the outer test set is used to choose parameters or thresholds.
+      test_p <- data.frame(
+        p_null = rep(stats::weighted.mean(train$obese, train$weight), nrow(test)),
+        p_logistic = q2_fit_predict(train, test, "logistic"),
+        p_gam = q2_fit_predict(train, test, "gam", selected$gam),
+        p_rf = q2_fit_predict(
+          train, test, "rf", selected$rf, trees = trees,
+          seed = q2_prediction_seed(seed, r * 100000L + f * 1000L + 999L)
+        )
+      )
+      predictions[[length(predictions) + 1L]] <- cbind(
+        test, data.frame(repeat_id = r, outer_fold = f), test_p
+      )
+      for (model in c("null", "logistic", "gam", "rf")) {
+        score <- weighted_binary_metrics(test$obese, test_p[[paste0("p_", model)]],
+                                         test$weight)
+        metrics[[length(metrics) + 1L]] <- cbind(
+          data.frame(repeat_id = r, outer_fold = f, model = model,
+                     n_train = nrow(train), n_test = nrow(test),
+                     test_weight_total = sum(test$weight), stringsAsFactors = FALSE),
+          as.data.frame(as.list(score))
+        )
+      }
+      message(sprintf("Prediction validation complete: repeat %d/%d, outer fold %d/%d",
+                      r, repeats, f, outer_k))
+    }
+  }
+
+  oof <- do.call(rbind, predictions)
+  oof <- oof[order(oof$repeat_id, oof$source_row_id), , drop = FALSE]
+  rownames(oof) <- NULL
+  for (r in seq_len(repeats)) {
+    obtained <- oof$source_row_id[oof$repeat_id == r]
+    stopifnot(length(obtained) == nrow(d), !anyDuplicated(obtained),
+              identical(sort(obtained), sort(d$source_row_id)))
+  }
+  stopifnot(nrow(oof) == nrow(d) * repeats,
+            all(is.finite(as.matrix(oof[c("p_null", "p_logistic", "p_gam", "p_rf")]))))
+
+  result <- list(
+    oof = oof,
+    fold_metrics = do.call(rbind, metrics),
+    tuning = do.call(rbind, tuning),
+    fold_audit = do.call(rbind, audits),
+    settings = list(
+      seed = seed, outer_k = outer_k, inner_k = inner_k, repeats = repeats,
+      outer_trees = trees, inner_trees = inner_trees,
+      predictors = c("diabetes", "vitamin_d", "upf_nutrient_proxy_pct10", "age", "sex"),
+      tuning_loss = "survey-weighted Brier score",
+      training_weight_normalisation = "weight / mean(training weight)",
+      grouping = "household_id; approximately balanced unweighted outcome counts",
+      classification_threshold = 0.5,
+      gam_grid = gam_grid, rf_grid = rf_grid
+    )
+  )
+  rownames(result$fold_metrics) <- rownames(result$tuning) <-
+    rownames(result$fold_audit) <- NULL
+  # Outer folds share training observations; do not treat fold/repeat scores as
+  # independent data for a naive t-test or standard-error calculation. Repeat
+  # spreads describe resampling stability, not population confidence intervals.
+  result
+}
+```
+
+```{r model-diagnostic-functions, include=FALSE}
+# Lecture-inspired sensitivity diagnostics for the existing Q2 analysis.
+# The analysis functions are defined earlier in this Rmd. No primary result or source data is changed.
+# All returned data frames are aggregate diagnostics/model summaries; participant
+# identifiers and person-level screening records remain local to this function.
+
+q2_model_diagnostics <- function(result, k=10) {
+  stopifnot(length(k)==1L,is.finite(k),k==as.integer(k),k>6L)
+  k <- as.integer(k)
+  d <- result$main_data
+  design <- result$main_design
+  reps <- result$input$reps
+  n <- nrow(d)
+  stopifnot(n>10L,length(reps)==60L,
+    identical(d$source_row_id,design$variables$source_row_id),
+    all(d$proxy_days %in% c(1L,2L)),all(is.finite(d$weight)),all(d$weight>0))
+  model_formula <- stats::formula(result$model)
+
+  # An auxiliary GLM gives the same weighted point estimate but model-based
+  # covariance/influence geometry. Its standard errors are NEVER substituted
+  # for the survey-replicate standard errors in the primary analysis.
+  work <- d
+  work$.diagnostic_weight <- work$weight/mean(work$weight)
+  aux <- stats::glm(model_formula,data=work,weights=.diagnostic_weight,
+    family=stats::quasibinomial(),control=stats::glm.control(maxit=100))
+  stopifnot(isTRUE(aux$converged),all(is.finite(stats::coef(aux))),
+    identical(names(stats::coef(aux)),names(stats::coef(result$model))),
+    max(abs(stats::coef(aux)-stats::coef(result$model)))<1e-6)
+
+  # Fox-Monette coefficient-correlation GVIF, as used for weighted GLMs by
+  # car::vif. Include the intercept in fitting, then omit it from this matrix.
+  # Group dummy coefficients by model term, so vitamin D contributes ONE
+  # 2-df diagnostic. Do not feed survey sandwich/replicate covariance into this
+  # calculation and interpret its result as pure predictor collinearity.
+  # These are weighted-GLM geometry diagnostics, not survey hypothesis tests.
+  mm <- stats::model.matrix(aux)
+  stopifnot(identical(colnames(mm),names(stats::coef(aux))))
+  assignment <- attr(mm,"assign")
+  slope <- assignment!=0L
+  stopifnot(qr(mm)$rank==ncol(mm),sum(!slope)==1L)
+  R <- stats::cov2cor(stats::vcov(aux)[slope,slope,drop=FALSE])
+  term_assignment <- assignment[slope]
+  term_names <- attr(stats::terms(aux),"term.labels")
+  logdet <- function(x) {
+    if(nrow(x)==0L) return(0)
+    z <- determinant(x,logarithm=TRUE)
+    stopifnot(z$sign>0,is.finite(as.numeric(z$modulus)))
+    as.numeric(z$modulus)
+  }
+  collinearity <- do.call(rbind,lapply(seq_along(term_names),function(j) {
+    use <- term_assignment==j
+    stopifnot(any(use))
+    gvif <- exp(logdet(R[use,use,drop=FALSE])+
+      logdet(R[!use,!use,drop=FALSE])-logdet(R))
+    stopifnot(is.finite(gvif),gvif>=1-1e-8)
+    data.frame(term=term_names[j],df=sum(use),GVIF=gvif,
+      GVIF_adjusted=gvif^(1/(2*sum(use))))
+  }))
+  # The dimension-adjusted column is on a standard-error (root-VIF) scale.
+  # Applying a raw VIF threshold such as 5 to this column would be misleading.
+  weighted_cor <- function(x,y,w) {
+    xc <- x-stats::weighted.mean(x,w)
+    yc <- y-stats::weighted.mean(y,w)
+    sum(w*xc*yc)/sqrt(sum(w*xc^2)*sum(w*yc^2))
+  }
+  numeric_correlation <- data.frame(variables="Age and combined nutrient proxy",
+    unweighted_pearson=stats::cor(d$age,d$upf_nutrient_proxy_pct10),
+    weighted_pearson=weighted_cor(d$age,d$upf_nutrient_proxy_pct10,d$weight))
+
+  # Ordinary GLM Cook distances are approximations and are used ONLY to rank
+  # records for sensitivity analysis. Reference lines 4/n and 2*p/n are
+  # descriptive heuristics, not survey-calibrated tests or deletion rules.
+  cook <- stats::cooks.distance(aux)
+  leverage <- stats::hatvalues(aux)
+  parameters <- length(stats::coef(aux))
+  stopifnot(length(cook)==n,length(leverage)==n,
+    all(is.finite(cook)),all(is.finite(leverage)),all(cook>=0),
+    all(leverage>=0),all(leverage<1))
+  # Fixed five-record screen, with source order breaking any exact ties.
+  # Each record is omitted separately, never cumulatively or from the main fit.
+  selected <- order(-cook,seq_len(n))[1:5]
+  influence_screen <- data.frame(n=n,parameters=parameters,refits=length(selected),
+    cook_reference=4/n,leverage_reference=2*parameters/n,
+    cook_above_reference=sum(cook>4/n),
+    leverage_above_reference=sum(leverage>2*parameters/n),
+    max_cook=max(cook),median_cook=stats::median(cook),
+    max_leverage=max(leverage),
+    auxiliary_max_coefficient_difference=
+      max(abs(stats::coef(aux)-stats::coef(result$model))))
+  primary_se <- sqrt(diag(stats::vcov(result$model)))
+  stopifnot(all(is.finite(primary_se)),all(primary_se>0))
+  sensitivity <- list(cbind(omitted_rank=0L,n=n,q2_or_table(result$model)))
+  change <- vector("list",length(selected))
+  for(j in seq_along(selected)) {
+    # Subset the existing full replicate design, preserving its scale,
+    # rscales, mse flag and all 60 original replicate weights. This is an
+    # actual refit, not the approximate one-step deletion behind Cook's D.
+    deletion_design <- design
+    deletion_design$variables$.diagnostic_keep <- seq_len(n)!=selected[j]
+    deletion_design <- subset(deletion_design,.diagnostic_keep)
+    stopifnot(nrow(deletion_design$variables)==n-1L,
+      identical(deletion_design$scale,design$scale),
+      identical(deletion_design$rscales,design$rscales),
+      identical(deletion_design$mse,design$mse))
+    fit <- survey::svyglm(model_formula,design=deletion_design,
+      family=stats::quasibinomial())
+    stopifnot(isTRUE(fit$converged),all(is.finite(stats::coef(fit))),
+      identical(names(stats::coef(fit)),names(stats::coef(result$model))))
+    sensitivity[[j+1L]] <- cbind(omitted_rank=j,n=n-1L,q2_or_table(fit))
+    delta <- (stats::coef(fit)-stats::coef(result$model))/primary_se
+    # Include all slopes (not the intercept) in the maximum summary.
+    change[[j]] <- data.frame(omitted_rank=j,
+      max_abs_change_survey_SE=max(abs(delta[names(delta)!="(Intercept)"])),
+      proxy_change_survey_SE=unname(delta["upf_nutrient_proxy_pct10"]))
+  }
+  influence_sensitivity <- do.call(rbind,sensitivity)
+  influence_change_summary <- do.call(rbind,change)
+
+  # Basis-dimension sensitivity is inferential, not a new CV tuning search.
+  # Both the formula and fixed knot grid receive k. Each specification retains
+  # its own fixed basis across its 61 full/replicate fits; smoothing is refitted.
+  # Basis matrices need not (and cannot) match across k=6 and k=10 models.
+  stopifnot(all(vapply(result$gam$model$smooth,function(s) s$bs.dim==6L,logical(1))))
+  high <- q2_gam_bundle(d,reps,q2_gam_formula(k=k),k=k,
+    label=paste0("Main GAM basis sensitivity k=",k))
+  df <- survey::degf(design)
+  linear <- q2_logit_bundle(result$model,d,reps)
+  display <- q2_main_curves(d,linear,high,df)
+  baseline_curves <- result$curves[result$curves$model=="GAM",,drop=FALSE]
+  high_curves <- display$curves[display$curves$model=="GAM",,drop=FALSE]
+  baseline_vitamin <- result$vitamin[result$vitamin$model=="GAM",,drop=FALSE]
+  high_vitamin <- display$vitamin[display$vitamin$model=="GAM",,drop=FALSE]
+  stopifnot(identical(baseline_curves$variable,high_curves$variable),
+    isTRUE(all.equal(baseline_curves$value,high_curves$value,tolerance=1e-12)),
+    identical(as.character(baseline_vitamin$vitamin_d),as.character(high_vitamin$vitamin_d)))
+  gam_k_curves <- rbind(cbind(basis_k=6L,baseline_curves),cbind(basis_k=k,high_curves))
+  gam_k_vitamin <- rbind(cbind(basis_k=6L,baseline_vitamin),cbind(basis_k=k,high_vitamin))
+  smooth_summary <- function(bundle,basis_k) {
+    st <- summary(bundle$model)$s.table
+    cap <- vapply(bundle$model$smooth,function(s) s$bs.dim-1L,numeric(1))
+    stopifnot(nrow(st)==length(cap))
+    data.frame(basis_k=basis_k,term=rownames(st),edf=st[,"edf"],
+      max_edf=cap,row.names=NULL)
+  }
+  gam_k_smooths <- rbind(smooth_summary(result$gam,6L),smooth_summary(high,k))
+
+  # Paired replicate changes use the same participants, averaging weights and
+  # scenarios. The original 25-point 5th-95th percentile grids are reused.
+  scenarios <- lapply(seq_len(nrow(baseline_curves)),function(i) {
+    v <- baseline_curves$variable[i]
+    value <- baseline_curves$value[i]/(if(v=="age") 1 else 10)
+    setNames(list(value),v)
+  })
+  vd <- levels(d$vitamin_d)
+  scenarios <- c(scenarios,lapply(vd,function(z) list(vitamin_d=z)))
+  metadata <- data.frame(variable=c(baseline_curves$variable,rep("vitamin_d",length(vd))),
+    value=c(baseline_curves$value,rep(NA_real_,length(vd))),
+    vitamin_d=c(rep(NA_character_,nrow(baseline_curves)),vd))
+  difference <- q2_standardise(high,d,scenarios)-
+    q2_standardise(result$gam,d,scenarios)
+  gam_k_differences <- cbind(metadata,q2_replicate_ci(difference,df,"identity"))
+  gam_k_stability <- do.call(rbind,lapply(unique(metadata$variable),function(v) {
+    change_pp <- 100*gam_k_differences$estimate[metadata$variable==v]
+    data.frame(variable=v,max_abs_change_pp=max(abs(change_pp)),
+      mean_abs_change_pp=mean(abs(change_pp)))
+  }))
+
+  # Dietary availability descriptions: no hypothesis tests, causal claims or
+  # assumptions that agreement/differences establish MAR, MCAR or absence of
+  # selection bias. Groups are defined WITHIN the primary analytic sample.
+  # Both means and prevalence percentages use original biomedical weights.
+  day_groups <- c("Day 1 only","Two valid days")
+  diet_day_summary <- do.call(rbind,lapply(1:2,function(days) {
+    x <- d[d$proxy_days==days,,drop=FALSE]
+    stopifnot(nrow(x)>0L)
+    data.frame(group=day_groups[days],n=nrow(x),
+      weighted_share_pct=100*sum(x$weight)/sum(d$weight),
+      age_mean=mean(x$age),age_weighted_mean=stats::weighted.mean(x$age,x$weight),
+      proxy_mean_pct=mean(x$upf_nutrient_proxy_pct),
+      proxy_weighted_mean_pct=stats::weighted.mean(x$upf_nutrient_proxy_pct,x$weight),
+      female_pct=100*mean(x$sex=="Female"),
+      female_weighted_pct=100*stats::weighted.mean(x$sex=="Female",x$weight),
+      obese_pct=100*mean(x$obese),
+      obese_weighted_pct=100*stats::weighted.mean(x$obese,x$weight))
+  }))
+  diet_day_vitamin <- do.call(rbind,lapply(1:2,function(days) {
+    x <- d[d$proxy_days==days,,drop=FALSE]
+    do.call(rbind,lapply(levels(d$vitamin_d),function(v) {
+      indicator <- x$vitamin_d==v
+      data.frame(group=day_groups[days],vitamin_d=v,n=sum(indicator),
+        unweighted_pct=100*mean(indicator),
+        weighted_pct=100*stats::weighted.mean(indicator,x$weight))
+    }))
+  }))
+  methods <- data.frame(item=c("Collinearity","Numeric correlation","Influence screen",
+    "Deletion sensitivity","GAM basis sensitivity","Dietary availability"),
+    description=c(
+      "Auxiliary normalized-biomedical-weight GLM coefficient-correlation GVIF, grouped by full model term. Model-based geometry, not survey inference. Adjusted GVIF is a root-VIF scale; no automatic variable deletion.",
+      "Unweighted Pearson and biomedical-prior-weighted Pearson for age/proxy; descriptive, not tests of independence or full-model collinearity.",
+      "Model-based approximate Cook distances/leverage from identical auxiliary GLM. Five largest Cook distances selected in advance; 4/n and 2p/n are heuristic references, not survey significance thresholds.",
+      "Five independent single-person deletion svyglm refits using the original 60-replicate design. Main analysis unchanged. CI calculations condition on selected omissions; not formal tests of whether those records are invalid.",
+      paste0("Main k=6 versus k=",k,"; 61 fixed-basis fits each, smoothing re-estimated. Common 25-point marginal grids and vitamin-D scenarios. Pointwise approximate replicate CIs and paired differences; no new held-out prediction claim."),
+      "Within-main-sample descriptive one- versus two-valid-day comparison using biomedical weights. Different exposure precision/sample composition; cannot diagnose or correct selection bias."))
+  list(collinearity=collinearity,numeric_correlation=numeric_correlation,
+    influence_screen=influence_screen,influence_sensitivity=influence_sensitivity,
+    influence_change_summary=influence_change_summary,gam_k_smooths=gam_k_smooths,
+    gam_k_curves=gam_k_curves,gam_k_vitamin=gam_k_vitamin,
+    gam_k_differences=gam_k_differences,gam_k_stability=gam_k_stability,
+    diet_day_summary=diet_day_summary,diet_day_vitamin=diet_day_vitamin,
+    methods=methods)
+}
+```
+
+```{r rf-diagnostic-functions, include=FALSE}
+# Post-validation explanation of the Q2 random forest.
+# The prediction functions are defined earlier in this Rmd.
+#
+# These diagnostics do NOT tune/refit the modelling strategy using test outcomes.
+# They reconstruct the already selected outer-fold forests, verify their original
+# held-out probabilities, then explain those fixed forests. No participant-level
+# data, predictions, identifiers or fitted forests are returned or written.
+#
+# Permutation importance measures the increase in held-out survey-weighted Brier
+# loss after uniformly shuffling one predictor within each outer test fold. The
+# outcome, other predictors and recipient survey weights stay fixed. This is a
+# specified model-reliance perturbation, not a causal effect, a coefficient test,
+# or a survey-design-adjusted inferential procedure. A negative importance can
+# occur and must not be truncated or interpreted as a protective association.
+#
+# Partial dependence integrates predictions over the other covariates of held-out
+# people, using their biomedical weights. Each person's prediction uses a forest
+# that excluded their household. Integration occurs across all folds in a repeat;
+# complete-repeat curves are then averaged. The common display grid uses the main
+# sample's unweighted 5th--95th percentiles (no outcome information). Correlation
+# can still create unrealistic covariate combinations; these are explanatory
+# model curves, not causal effects or observed prevalence within a subgroup.
+
+q2_rf_diagnostics <- function(prediction, d, seed = 3888, trees = 500) {
+  helper_names <- c("q2_validate_prediction_data", "q2_prediction_seed",
+                    "q2_prediction_split_audit")
+  # Explicit closure lookup also works in a fresh, non-global knit environment.
+  if (!all(vapply(helper_names, function(nm)
+    exists(nm, mode = "function", inherits = TRUE), logical(1)))) {
+    stop("Evaluate the prediction-functions chunk before computing RF diagnostics.")
+  }
+  if (!requireNamespace("ranger", quietly = TRUE)) {
+    stop("The ranger package is required for RF diagnostics.")
+  }
+  if (length(seed) != 1L || !is.finite(seed) || length(trees) != 1L ||
+      !is.finite(trees) || trees < 1L || trees != as.integer(trees)) {
+    stop("Invalid diagnostic seed or number of trees.")
+  }
+  q2_validate_prediction_data(d)
+  features <- c("diabetes", "vitamin_d", "upf_nutrient_proxy_pct10", "age", "sex")
+  feature_labels <- c("Diabetes status", "Blood vitamin D category", "Combined nutrient proxy",
+                      "Age", "Sex")
+  n_permutations <- 20L
+  n_grid <- 31L
+  tolerance <- 1e-12
+  if (!is.list(prediction) ||
+      !all(c("oof", "tuning", "settings") %in% names(prediction))) {
+    stop("prediction must contain saved OOF predictions, tuning and settings.")
+  }
+  settings <- prediction$settings
+  if (!identical(as.character(settings$predictors), features) ||
+      length(settings$outer_trees) != 1L || settings$outer_trees != trees ||
+      length(settings$seed) != 1L || !is.finite(settings$seed)) {
+    stop("The saved prediction settings do not match the five-predictor RF or tree count.")
+  }
+  oof <- prediction$oof
+  oof_required <- c("source_row_id", "household_id", "obese", features,
+                    "weight", "repeat_id", "outer_fold", "p_rf")
+  if (!is.data.frame(oof) || !all(oof_required %in% names(oof)) ||
+      anyNA(oof[, oof_required, drop = FALSE]) ||
+      any(!is.finite(oof$p_rf)) || any(oof$p_rf < 0 | oof$p_rf > 1)) {
+    stop("Saved OOF data lack the fields required for an exact reconstruction.")
+  }
+  tuning <- prediction$tuning
+  tune_required <- c("repeat_id", "outer_fold", "model", "selected", "mtry",
+                     "min_node_size")
+  if (!is.data.frame(tuning) || !all(tune_required %in% names(tuning))) {
+    stop("Saved tuning results are incomplete.")
+  }
+  repeats <- sort(unique(oof$repeat_id))
+  expected_repeats <- seq_len(settings$repeats)
+  expected_folds <- seq_len(settings$outer_k)
+  if (!identical(as.integer(repeats), expected_repeats) ||
+      length(expected_folds) < 2L || nrow(oof) != nrow(d) * length(repeats)) {
+    stop("OOF repetition labels/coverage are inconsistent with the saved settings.")
+  }
+  selected <- tuning[tuning$model == "rf" & tuning$selected %in% TRUE,
+                     tune_required, drop = FALSE]
+  if (nrow(selected) != length(repeats) * length(expected_folds)) {
+    stop("Exactly one selected RF configuration is required per outer fold.")
+  }
+
+  # Leave the caller's RNG state untouched. The original modelling seed is read
+  # from prediction$settings; seed here controls only diagnostic permutations.
+  had_seed <- exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)
+  if (had_seed) previous_seed <- get(".Random.seed", envir = .GlobalEnv)
+  on.exit({
+    if (had_seed) {
+      assign(".Random.seed", previous_seed, envir = .GlobalEnv)
+    } else if (exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)) {
+      rm(list = ".Random.seed", envir = .GlobalEnv)
+    }
+  }, add = TRUE)
+
+  # The original prediction runner sorted on source_row_id before fitting.
+  d <- d[order(d$source_row_id), , drop = FALSE]
+  rownames(d) <- NULL
+  grid <- do.call(rbind, lapply(c("upf_nutrient_proxy_pct10", "age"), function(v) {
+    limits <- stats::quantile(d[[v]], c(.05, .95), names = FALSE)
+    if (any(!is.finite(limits)) || diff(limits) <= 0) {
+      stop("Cannot construct a non-degenerate PDP grid for ", v)
+    }
+    values <- seq(limits[1], limits[2], length.out = n_grid)
+    data.frame(variable = v, model_value = values,
+               value = if (v == "age") values else values * 10,
+               units = if (v == "age") "years" else "energy percentage points",
+               stringsAsFactors = FALSE)
+  }))
+  grid$grid_id <- seq_len(nrow(grid))
+  rownames(grid) <- NULL
+  loss_sum <- array(0, dim = c(length(repeats), length(features), n_permutations))
+  baseline_sum <- numeric(length(repeats))
+  weight_sum <- numeric(length(repeats))
+  pdp_sum <- matrix(0, nrow = length(repeats), ncol = nrow(grid))
+  outside_training_sum <- matrix(0, nrow = length(repeats), ncol = nrow(grid))
+  validation <- list()
+
+  predict_probability <- function(fitted, newdata) {
+    probability <- stats::predict(fitted, data = newdata,
+                                   num.threads = 1L)$predictions
+    if (!is.matrix(probability) || !"Obese" %in% colnames(probability)) {
+      stop("Reconstructed forest did not return the expected positive class.")
+    }
+    p <- as.numeric(probability[, "Obese"])
+    if (length(p) != nrow(newdata) || any(!is.finite(p)) || any(p < 0 | p > 1)) {
+      stop("Reconstructed forest returned invalid probabilities.")
+    }
+    p
+  }
+
+  for (ri in seq_along(repeats)) {
+    r <- repeats[ri]
+    saved <- oof[oof$repeat_id == r, , drop = FALSE]
+    if (anyDuplicated(saved$source_row_id) ||
+        !setequal(saved$source_row_id, d$source_row_id) ||
+        !identical(sort(unique(as.integer(saved$outer_fold))), expected_folds)) {
+      stop("OOF rows/folds do not cover the main sample exactly once in repeat ", r)
+    }
+    saved <- saved[match(d$source_row_id, saved$source_row_id), , drop = FALSE]
+    # Detect stale caches or altered data before attempting reconstruction.
+    for (v in c("obese", features, "weight", "household_id")) {
+      same <- if (is.factor(d[[v]])) {
+        is.factor(saved[[v]]) && identical(levels(d[[v]]), levels(saved[[v]])) &&
+          identical(as.character(d[[v]]), as.character(saved[[v]]))
+      } else if (v == "household_id") {
+        identical(as.character(d[[v]]), as.character(saved[[v]]))
+      } else {
+        isTRUE(all.equal(d[[v]], saved[[v]], tolerance = 0,
+                         check.attributes = FALSE))
+      }
+      if (!same) stop("Saved prediction data differ from current data for ", v)
+    }
+
+    for (f in expected_folds) {
+      is_test <- saved$outer_fold == f
+      train <- d[!is_test, , drop = FALSE]
+      test <- d[is_test, , drop = FALSE]
+      audit <- q2_prediction_split_audit(train, test, r, f)
+      config <- selected[selected$repeat_id == r & selected$outer_fold == f,
+                         , drop = FALSE]
+      if (nrow(config) != 1L || !config$mtry %in% c(2L, 4L) ||
+          !config$min_node_size %in% c(15L, 40L)) {
+        stop("Selected RF configuration is invalid for repeat/fold ", r, "/", f)
+      }
+      xtrain <- train[, c("obese", features), drop = FALSE]
+      xtest <- test[, features, drop = FALSE]
+      xtrain$obese <- factor(xtrain$obese, levels = c(0, 1),
+                             labels = c("Not obese", "Obese"))
+      fit_seed <- q2_prediction_seed(settings$seed, r * 100000L + f * 1000L + 999L)
+      fitted <- ranger::ranger(
+        obese ~ diabetes + vitamin_d + upf_nutrient_proxy_pct10 + age + sex,
+        data = xtrain, probability = TRUE, num.trees = as.integer(trees),
+        mtry = as.integer(config$mtry), min.node.size = as.integer(config$min_node_size),
+        case.weights = train$weight / mean(train$weight),
+        respect.unordered.factors = "order", num.threads = 1L,
+        seed = fit_seed, write.forest = TRUE, importance = "none"
+      )
+      baseline <- predict_probability(fitted, xtest)
+      reconstruction_error <- max(abs(baseline - saved$p_rf[is_test]))
+      if (reconstruction_error > tolerance) {
+        stop(sprintf(paste0("RF reconstruction failed for repeat %d/fold %d: ",
+                            "max probability difference %.16g exceeds %.1e. ",
+                            "Check package versions, data and saved settings."),
+                     r, f, reconstruction_error, tolerance))
+      }
+      fold_weight <- sum(test$weight)
+      fold_baseline_sum <- sum(test$weight * (test$obese - baseline)^2)
+      baseline_sum[ri] <- baseline_sum[ri] + fold_baseline_sum
+      weight_sum[ri] <- weight_sum[ri] + fold_weight
+
+      for (vi in seq_along(features)) {
+        v <- features[vi]
+        # Uniform permutations of held-out rows; case weights stay attached to
+        # recipients. Factor indexing preserves the original factor levels.
+        perturbed <- lapply(seq_len(n_permutations), function(b) {
+          set.seed(q2_prediction_seed(seed, 20000000 + r * 1000000 +
+                                       f * 10000 + vi * 100 + b))
+          nd <- xtest
+          nd[[v]] <- xtest[[v]][sample.int(nrow(xtest))]
+          nd
+        })
+        p <- matrix(predict_probability(fitted, do.call(rbind, perturbed)),
+                    nrow = nrow(test), ncol = n_permutations)
+        squared_error <- sweep(p, 1L, test$obese, "-")^2
+        loss_sum[ri, vi, ] <- loss_sum[ri, vi, ] +
+          colSums(sweep(squared_error, 1L, test$weight, "*"))
+      }
+
+      scenarios <- lapply(seq_len(nrow(grid)), function(g) {
+        nd <- xtest
+        nd[[grid$variable[g]]] <- rep(grid$model_value[g], nrow(nd))
+        nd
+      })
+      pdp_predictions <- matrix(
+        predict_probability(fitted, do.call(rbind, scenarios)),
+        nrow = nrow(test), ncol = nrow(grid)
+      )
+      pdp_sum[ri, ] <- pdp_sum[ri, ] +
+        colSums(sweep(pdp_predictions, 1L, test$weight, "*"))
+      outside <- vapply(seq_len(nrow(grid)), function(g) {
+        observed_range <- range(train[[grid$variable[g]]])
+        grid$model_value[g] < observed_range[1] ||
+          grid$model_value[g] > observed_range[2]
+      }, logical(1))
+      outside_training_sum[ri, ] <- outside_training_sum[ri, ] +
+        as.numeric(outside) * fold_weight
+
+      validation[[length(validation) + 1L]] <- cbind(
+        audit,
+        data.frame(mtry = config$mtry, min_node_size = config$min_node_size,
+                   trees = trees, forest_seed = fit_seed,
+                   max_abs_prediction_difference = reconstruction_error,
+                   weighted_baseline_brier = fold_baseline_sum / fold_weight,
+                   test_weight_total = fold_weight)
+      )
+      message(sprintf("RF explanations complete: repeat %d/%d, outer fold %d/%d",
+                      r, length(repeats), f, length(expected_folds)))
+    }
+    if (!isTRUE(all.equal(weight_sum[ri], sum(d$weight), tolerance = 1e-12))) {
+      stop("A complete repeat did not integrate all main-sample analysis weights.")
+    }
+  }
+
+  baseline_brier <- baseline_sum / weight_sum
+  importance_draws <- do.call(rbind, lapply(seq_along(repeats), function(ri) {
+    do.call(rbind, lapply(seq_along(features), function(vi) {
+      permuted_brier <- loss_sum[ri, vi, ] / weight_sum[ri]
+      data.frame(repeat_id = repeats[ri], feature = features[vi],
+                 feature_label = feature_labels[vi], permutation = seq_len(n_permutations),
+                 baseline_brier = baseline_brier[ri], permuted_brier = permuted_brier,
+                 brier_increase = permuted_brier - baseline_brier[ri],
+                 stringsAsFactors = FALSE)
+    }))
+  }))
+  importance_by_repeat <- do.call(rbind, lapply(seq_along(repeats), function(ri) {
+    do.call(rbind, lapply(seq_along(features), function(vi) {
+      z <- importance_draws[importance_draws$repeat_id == repeats[ri] &
+                              importance_draws$feature == features[vi], ]
+      data.frame(repeat_id = repeats[ri], feature = features[vi],
+                 feature_label = feature_labels[vi], baseline_brier = baseline_brier[ri],
+                 brier_increase = mean(z$brier_increase),
+                 permutation_mc_sd = stats::sd(z$brier_increase),
+                 permutation_mc_min = min(z$brier_increase),
+                 permutation_mc_max = max(z$brier_increase),
+                 stringsAsFactors = FALSE)
+    }))
+  }))
+  importance <- do.call(rbind, lapply(seq_along(features), function(vi) {
+    z <- importance_draws[importance_draws$feature == features[vi], ]
+    # Pair permutation index b across repeats only to describe the Monte Carlo
+    # variation of the repeat-averaged estimate, conditional on these fixed fits.
+    averaged_draws <- vapply(seq_len(n_permutations), function(b) {
+      mean(z$brier_increase[z$permutation == b])
+    }, numeric(1))
+    repeat_means <- importance_by_repeat$brier_increase[
+      importance_by_repeat$feature == features[vi]]
+    data.frame(feature = features[vi], feature_label = feature_labels[vi],
+               baseline_brier = mean(baseline_brier),
+               brier_increase = mean(averaged_draws),
+               permutation_mc_sd = stats::sd(averaged_draws),
+               permutation_mc_p025 = unname(stats::quantile(averaged_draws, .025)),
+               permutation_mc_p975 = unname(stats::quantile(averaged_draws, .975)),
+               permutation_mc_min = min(averaged_draws),
+               permutation_mc_max = max(averaged_draws),
+               repeat_mean_min = min(repeat_means), repeat_mean_max = max(repeat_means),
+               permutations_per_fold = n_permutations, repeats = length(repeats),
+               stringsAsFactors = FALSE)
+  }))
+
+  pdp_repeat_matrix <- sweep(pdp_sum, 1L, weight_sum, "/")
+  outside_repeat_matrix <- sweep(outside_training_sum, 1L, weight_sum, "/")
+  pdp_by_repeat <- do.call(rbind, lapply(seq_along(repeats), function(ri) {
+    cbind(data.frame(repeat_id = repeats[ri]), grid,
+          data.frame(predicted_probability = pdp_repeat_matrix[ri, ],
+                     predicted_prevalence_pct = 100 * pdp_repeat_matrix[ri, ],
+                     outside_training_range_weight_fraction = outside_repeat_matrix[ri, ]))
+  }))
+  pdp <- cbind(grid, data.frame(
+    predicted_probability = colMeans(pdp_repeat_matrix),
+    predicted_prevalence_pct = 100 * colMeans(pdp_repeat_matrix),
+    repeat_min = apply(pdp_repeat_matrix, 2L, min),
+    repeat_max = apply(pdp_repeat_matrix, 2L, max),
+    outside_training_range_weight_fraction = colMeans(outside_repeat_matrix)
+  ))
+  validation <- do.call(rbind, validation)
+  stopifnot(nrow(validation) == length(repeats) * length(expected_folds),
+            all(validation$households_shared == 0L),
+            all(validation$max_abs_prediction_difference <= tolerance),
+            all(is.finite(importance$brier_increase)),
+            all(is.finite(pdp$predicted_probability)),
+            all(pdp$predicted_probability >= 0 & pdp$predicted_probability <= 1))
+
+  result <- list(
+    importance = importance,
+    importance_by_repeat = importance_by_repeat,
+    importance_draws = importance_draws,
+    pdp = pdp,
+    pdp_by_repeat = pdp_by_repeat,
+    validation = validation,
+    settings = list(
+      diagnostic_seed = seed, original_prediction_seed = settings$seed,
+      ranger_version = as.character(utils::packageVersion("ranger")),
+      trees = trees, outer_folds = length(expected_folds), repeats = length(repeats),
+      predictors = features, permutations_per_fold = n_permutations,
+      prediction_match_tolerance = tolerance, main_sample_n = nrow(d),
+      main_households_n = length(unique(d$household_id)),
+      pdp_grid = "31 points per numeric feature; unweighted main-sample 5th--95th percentiles",
+      integration = "Survey-weighted complete-repeat estimates, then equal mean across repeats",
+      permutation = "Uniform shuffle within held-out fold; recipient outcomes and weights unchanged",
+      uncertainty = paste("Permutation MC spreads and repeat ranges are descriptive only:",
+                          "not confidence intervals, significance tests or retraining uncertainty."),
+      interpretation = paste("Model explanations, not causal effects or measured UPF consumption;",
+                             "PDP combinations can be unrealistic when predictors are associated."),
+      outputs = "Aggregate diagnostic tables only; no person-level records or fitted forests"
+    )
+  )
+  for (nm in setdiff(names(result), "settings")) rownames(result[[nm]]) <- NULL
+  result
+}
+```
+
+```{r run-analysis, include=FALSE}
+data_dir <- normalizePath(params$data_dir,mustWork=TRUE)
+q2_prediction_self_test()
+message("Fitting survey-weighted associations and GAM replicate models...")
+result <- q2_compute_associations(data_dir)
+message("Running household-grouped nested cross-validation...")
+result$prediction <- run_prediction_comparison(result$main_data,
+  seed=params$seed,outer_k=5,inner_k=3,repeats=params$cv_repeats,trees=params$rf_trees)
+result$prediction_summary <- q2_prediction_summary(result$prediction,
+  result$main_data,result$input$reps,survey::degf(result$main_design))
+message("Checking model sensitivity and RF explanations...")
+result$model_checks <- q2_model_diagnostics(result,k=10)
+result$rf_checks <- q2_rf_diagnostics(result$prediction,result$main_data,
+  seed=params$seed,trees=params$rf_trees)
+stopifnot(identical(result$input$hashes,unname(tools::md5sum(result$input$paths))))
+if(params$export_results) {
+  q2_export_results(result,params$output_dir)
+  for(section in c("model_checks","rf_checks")) for(nm in names(result[[section]])) {
+    tab <- result[[section]][[nm]]
+    if(is.data.frame(tab)) data.table::fwrite(tab,file.path(params$output_dir,
+      paste0(section,"_",nm,".csv")))
+  }
+}
+```
+
+```{r display-helpers, include=FALSE}
+fmt_n <- function(x) format(x,big.mark=",",trim=TRUE,scientific=FALSE)
+fmt_p <- function(x) format.pval(x,digits=3,eps=.001)
+fmt_ci <- function(x,lo,hi,digits=2) sprintf(paste0("%.",digits,"f (%.",digits,"f to %.",digits,"f)"),x,lo,hi)
+ci_row <- function(row,digits=2) fmt_ci(row$estimate,row$low,row$high,digits)
+assoc <- result$association_tests
+metric <- result$prediction_summary$metrics
+metric_value <- function(model,what) metric$estimate[metric$model==model & metric$metric==what]
+proxy_or <- subset(result$odds,grepl("^Combined",contrast))
+severe_or <- subset(result$odds,grepl("Moderate/severe",contrast))
+influence_refits <- subset(result$model_checks$influence_sensitivity,omitted_rank>0)
+influence_proxy <- subset(influence_refits,grepl("^Combined",contrast))
+influence_vitamin <- subset(influence_refits,grepl("Moderate/severe",contrast))
+two_day <- subset(result$proxy_sensitivity,analysis=="Two valid days only")
+stability <- result$model_checks$gam_k_stability
+day_summary <- result$model_checks$diet_day_summary
+day_vitamin <- subset(result$model_checks$diet_day_vitamin,
+  vitamin_d=="Moderate/severe deficiency")
+palette <- c(Logistic="#246C7B",GAM="#B34F2F",RF="#7561A8",Null="#777777")
+save_plot <- function(p,name,width=10,height=4.4) {
+  if(params$export_results) ggsave(file.path(params$output_dir,name),p,
+    width=width,height=height,dpi=200,bg="white")
+  p
+}
+```
+
+```{r additional-figure-exports, include=FALSE}
+# Refresh the two stand-alone figures retained in the results folder without
+# lengthening the report. These must never remain from an earlier model.
+if(params$export_results) {
+  v <- result$vitamin
+  v$vitamin_d <- factor(v$vitamin_d,levels=levels(result$main_data$vitamin_d))
+  p <- ggplot(v,aes(vitamin_d,100*estimate,colour=model))+
+    geom_errorbar(aes(ymin=100*low,ymax=100*high),width=.12,position=position_dodge(.35))+
+    geom_point(size=2.8,position=position_dodge(.35))+
+    scale_colour_manual(values=palette)+
+    scale_x_discrete(labels=c("Adequate\n>=50","Mild deficiency\n30-49","Moderate/severe\n<30"))+
+    labs(x="Blood vitamin D category (nmol/L)",y="Adjusted obesity prevalence (%)",colour=NULL,
+      title="Vitamin D comparisons after adjustment",
+      caption="Common diabetes/proxy/age/sex distribution; survey-replicate pointwise 95% CIs.")
+  save_plot(p,"01_adjusted_vitamin_d.png")
+  m <- metric[metric$model!="Null" & metric$metric %in% c("brier","auc"),]
+  m$metric <- factor(m$metric,levels=c("brier","auc"),
+    labels=c("Brier score: lower is better","AUC: higher is better"))
+  m$model <- factor(m$model,levels=c("RF","GAM","Logistic"))
+  p <- ggplot(m,aes(estimate,model,colour=model))+
+    geom_segment(aes(x=low,xend=high,yend=model),linewidth=.8)+geom_point(size=3)+
+    facet_wrap(~metric,scales="free_x")+scale_colour_manual(values=palette)+
+    labs(x=NULL,y=NULL,colour=NULL,title="Held-out predictive performance",
+      caption="Conditional survey-replicate 95% CIs; model-development uncertainty excluded.")+
+    theme(legend.position="none")
+  save_plot(p,"04_prediction_comparison.png",height=4.1)
+}
+```
+
+<style>
+:root { --ink: #243744; --accent: #246c7b; --muted: #5c6a72; --line: #dce4e8; }
+body {
+  font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+  font-size: 16px; line-height: 1.65; color: var(--ink); background: #fff;
+}
+div.main-container { max-width: 1240px; padding-top: 28px; padding-bottom: 56px; }
+h1, h2, h3, h4 { font-family: inherit; font-weight: 600; line-height: 1.22; }
+h1.title { font-size: 40px; letter-spacing: -.8px; margin-bottom: 10px; }
+h3.subtitle { font-size: 20px; color: var(--muted); font-weight: 400; margin-top: 0; }
+.section > h1 { font-size: 26px; margin-top: 38px; padding-top: 12px;
+  border-top: 1px solid var(--line); }
+h2 { font-size: 22px; } h3 { font-size: 19px; }
+a { color: #176679; } a:hover { color: #104451; }
+p { margin: 0 0 15px; } li { margin-bottom: 8px; }
+#TOC { font-size: 13px; line-height: 1.4; border-color: var(--line); }
+.tocify .tocify-item.active { background-color: var(--accent); color: #fff; }
+.takeaway { margin: 25px 0; padding: 18px 22px; background: #f0f6f7;
+  border-left: 4px solid var(--accent); border-radius: 0 6px 6px 0; }
+.takeaway p:last-child { margin-bottom: 0; }
+.takeaway-label { color: #176679; font-size: 13px; font-weight: 700;
+  letter-spacing: .06em; text-transform: uppercase; }
+table { width: 100%; margin: 22px 0; font-size: 14px; line-height: 1.5; }
+table th { background: #edf4f5; color: #1c515c; }
+table th, table td { padding: 10px 12px !important; vertical-align: top !important; }
+table tbody tr:nth-child(even) { background: #f8fafb; }
+caption, .caption { font-size: 13px; line-height: 1.5; color: var(--muted);
+  text-align: left; margin-top: 8px; }
+details { margin: 18px 0; padding: 12px 16px; border: 1px solid var(--line);
+  border-radius: 6px; background: #fff; }
+summary { cursor: pointer; font-weight: 600; color: #245563; }
+summary:focus { outline: 2px solid var(--accent); outline-offset: 4px; }
+pre { max-height: 520px; overflow: auto; font-size: 12px; line-height: 1.5;
+  border-color: var(--line); background: #f7f9fa; }
+code { color: #314856; background: #f1f4f6; }
+pre code { white-space: pre; }
+.code-folding-btn { font-size: 12px; margin-bottom: 5px; }
+img { max-width: 100%; height: auto; }
+@media (max-width: 767px) {
+  body { font-size: 15px; } h1.title { font-size: 31px; }
+  div.main-container { padding-top: 12px; }
+  table { display: block; overflow-x: auto; }
+  .takeaway { padding: 14px 16px; }
+}
+@media print {
+  #TOC, .code-folding-btn, .code-download { display: none !important; }
+  body { font-size: 11pt; color: #222; } div.main-container { max-width: none; }
+  .section > h1 { break-after: avoid; }
+  img, table, .takeaway { break-inside: avoid; }
+}
+</style>
+
+<div class="takeaway">
+<p class="takeaway-label">Main findings</p>
+
+We retain the **logistic GLM**: neither GAM nor RF improved held-out performance in the settings tested. Moderate/severe vitamin D deficiency and a higher nutrient proxy were associated with higher adjusted obesity odds. Evidence that the vitamin D association differed by diabetes status remained inconclusive (**p = `r fmt_p(result$interaction$tests$p_value[1])`**).
+
+</div>
+
+# Scope
+
+We assessed vitamin D and a nutrient proxy in relation to measured obesity, and whether the vitamin D association differed by diabetes status, among **non-pregnant Australians aged 18–64** in the 2011–12 NNPAS. The main complete-case sample contained **`r fmt_n(result$samples$n[1])` participants**, including `r fmt_n(result$samples$obese_n[1])` with obesity: `r sprintf("%.1f%%",result$samples$unweighted_pct[1])` unweighted and `r sprintf("%.1f%%",result$samples$weighted_pct[1])` survey-weighted.
+
+Obesity was measured BMI ≥30 kg/m²; vitamin D categories were adequate ≥50, mild deficiency 30–49 and moderate/severe deficiency <30 nmol/L.
+
+The proxy is the equal-day mean of saturated/trans-fat plus added-sugar energy percentages: two valid recalls for `r fmt_n(sum(result$main_data$proxy_days==2))` participants, otherwise Day 1 alone (`r fmt_n(sum(result$main_data$proxy_days==1))`). It is **not measured UPF or usual dietary intake**. We retained vitamin D as categorical and adjusted for **diabetes, numeric age and sex** throughout. Requiring diabetes status excluded `r sum(result$input$data$exposure_complete)-nrow(result$main_data)` additional records. Pregnancy was handled by exclusion, not a model term.
+
+# Why we use GLM, GAM and RF
+
+Our main aim is to estimate interpretable associations. We also check whether the baseline's simpler structure misses patterns that matter for prediction.
+
+- **Logistic GLM: primary association model.** Obesity is binary, so a logit model keeps predicted probabilities between 0 and 1 and gives interpretable adjusted odds ratios. Survey-based uncertainty accommodates the sampling design. Its main restriction here is that age and the proxy contribute linearly on the **log-odds scale**, not the probability scale. [Survey GLM documentation](https://r-survey.r-forge.r-project.org/survey/html/svyglm.html).
+- **Logistic GAM: targeted check of linearity.** We replace the linear age and proxy terms with penalised smooths, allowing gradual nonlinear relationships while keeping separate, interpretable predictor contributions. This checks whether a constant log-odds slope is too restrictive. Our main GAM remains additive: it does not automatically discover interactions. [GAM documentation](https://stat.ethz.ch/R-manual/R-devel/library/mgcv/html/gam.html).
+- **Random forest: broader check of model structure.** RF can capture nonlinearities, thresholds and interactions through successive splits without specifying their shapes beforehand. It therefore relaxes both the linearity restriction of our GLM and the additivity restriction retained by our main GAM. Averaging many randomised trees reduces reliance on an unstable single-tree fit. We use a probability forest so its predictions can be evaluated on the same scale as GLM/GAM. [Breiman (2001)](https://www.stat.berkeley.edu/~breiman/randomforest2001.pdf), [ranger documentation](https://imbs-hl.github.io/ranger/reference/ranger.html).
+
+RF's purpose is to ask whether that extra flexibility improves **held-out prediction**. Permutation importance and partial dependence help describe what it learned; neither supplies adjusted odds ratios or survey-adjusted significance tests. Better RF performance would motivate investigation of model structure, not establish a particular interaction. No improvement would not prove linearity or absence of interactions. We test the specific vitamin D–diabetes interaction separately.
+
+# Adjusted associations and nonlinearity
+
+We fitted a survey-weighted logistic GLM and a logistic GAM with cubic smooths for the proxy and age (k = 6, REML). Both used the same sample and predictors, without a vitamin D–proxy interaction.
+
+```{r model-specifications, eval=FALSE}
+obese ~ diabetes + vitamin_d + upf_nutrient_proxy_pct10 + age + sex
+obese ~ diabetes + vitamin_d + s(upf_nutrient_proxy_pct10,k=6,bs="cr") +
+  s(age,k=6,bs="cr") + sex
+```
+
+```{r adjusted-associations, echo=FALSE}
+x <- result$odds
+labels <- sub("^vitamin_d","",x$contrast)
+labels[grepl("deficiency",labels)] <- paste0(labels[grepl("deficiency",labels)]," vs adequate")
+kable(data.frame(Contrast=labels,`Adjusted OR (95% CI)`=ci_row(x),
+  `Raw p`=fmt_p(x$p_value),check.names=FALSE))
+```
+
+Vitamin D was associated with obesity overall (Holm p = `r fmt_p(assoc$p_holm[1])`), driven by the moderate/severe contrast. The proxy association was positive (Holm p `r if(assoc$p_holm[2]<.001) "< 0.001" else paste0("= ",fmt_p(assoc$p_holm[2]))`). These are **conditional odds ratios**, not prevalence ratios or causal effects. Including diabetes estimates associations at the same diabetes status; it does not establish diabetes as a causal confounder.
+
+The survey-adjusted restricted-cubic-spline test gave **p = `r fmt_p(result$nonlinearity$tests$p_value[1])`** jointly for nonlinearity; component raw p-values were `r fmt_p(result$nonlinearity$tests$p_value[2])` for the proxy and `r fmt_p(result$nonlinearity$tests$p_value[3])` for age. This tests a specified spline basis, not all possible departures from linearity.
+
+```{r adjusted-curves, echo=FALSE, fig.width=11, fig.height=4.2}
+x <- result$curves
+variable_labels <- c(upf_nutrient_proxy_pct10="Nutrient proxy (% energy)",age="Age (years)")
+x$variable <- factor(x$variable,levels=names(variable_labels),labels=variable_labels)
+rug <- do.call(rbind,lapply(names(variable_labels),function(v) {
+  z <- result$main_data[[v]]
+  use <- z>=quantile(z,.05) & z<=quantile(z,.95)
+  data.frame(variable=variable_labels[[v]],value=z[use]*if(v=="age") 1 else 10)
+}))
+rug$variable <- factor(rug$variable,levels=variable_labels)
+p <- ggplot(x,aes(value,100*estimate,colour=model,fill=model))+
+  geom_ribbon(aes(ymin=100*low,ymax=100*high),alpha=.12,colour=NA)+
+  geom_line(linewidth=.8)+geom_rug(data=rug,aes(x=value),inherit.aes=FALSE,alpha=.08)+
+  facet_wrap(~variable,scales="free_x")+
+  scale_colour_manual(values=palette)+scale_fill_manual(values=palette)+
+  labs(x=NULL,y="Standardised obesity prevalence (%)",colour=NULL,fill=NULL,
+    title="GLM and GAM adjusted curves",
+    caption="Survey-standardised; central 90% of each predictor; pointwise 95% CIs. Rugs indicate observed values.")
+save_plot(p,"02_adjusted_curves.png",11,4.2)
+```
+
+# Diagnostics and sensitivity
+
+```{r diagnostic-summary, echo=FALSE}
+range_text <- function(x) sprintf("%.2f to %.2f",min(x),max(x))
+checks <- data.frame(Check=c("Collinearity","Influence: five separate single-record omissions",
+  "Higher GAM basis: k = 10","Two valid dietary days only"),
+  Finding=c(
+    sprintf("GVIF^(1/(2df)) %.3f to %.3f; weighted age-proxy correlation %.3f.",
+      min(result$model_checks$collinearity$GVIF_adjusted),
+      max(result$model_checks$collinearity$GVIF_adjusted),
+      result$model_checks$numeric_correlation$weighted_pearson),
+    paste0("Proxy OR ",range_text(influence_proxy$estimate),
+      "; moderate/severe vitamin D OR ",range_text(influence_vitamin$estimate),"."),
+    sprintf("Largest curve changes: proxy %.2f pp, age %.2f pp; vitamin D estimates %.2f pp.",
+      stability$max_abs_change_pp[stability$variable=="upf_nutrient_proxy_pct10"],
+      stability$max_abs_change_pp[stability$variable=="age"],
+      stability$max_abs_change_pp[stability$variable=="vitamin_d"]),
+    paste0("n = ",fmt_n(unique(two_day$n)),"; proxy OR ",
+      ci_row(subset(two_day,grepl("^Combined",contrast))),
+      "; moderate/severe vitamin D OR ",ci_row(subset(two_day,grepl("Moderate/severe",contrast))),".")))
+kable(checks)
+```
+
+GVIF and Cook's distance were auxiliary weighted-GLM diagnostics; omission sensitivities used survey refits and did not alter the primary sample. The proxy curve was stable to k, but **the age curve was not fully settled**. The two-day restriction changes both sample composition and measurement completeness; its vitamin D interval includes 1.
+
+Day 1-only and two-day groups had similar weighted obesity prevalence (`r sprintf("%.1f%% vs %.1f%%",day_summary$obese_weighted_pct[1],day_summary$obese_weighted_pct[2])`), but moderate/severe deficiency differed (`r sprintf("%.1f%% vs %.1f%%",day_vitamin$weighted_pct[1],day_vitamin$weighted_pct[2])`). This does not establish random recall missingness.
+
+# Diabetes interaction
+
+As a separate secondary analysis, we fitted `obese ~ vitamin_d_binary * diabetes + upf_nutrient_proxy_pct10 + age + sex`; the GAM smoothed the proxy and age. We combined the two deficiency categories (<50 nmol/L) because diabetic cells were sparse. We used the **same `r fmt_n(result$samples$n[2])` participants**, including only **`r sum(result$interaction$cells$n[result$interaction$cells$diabetes=="Diabetes"])` with diabetes**. The odds-scale interaction remained inconclusive: GLM p = **`r fmt_p(result$interaction$tests$p_value[1])`**, GAM p = `r fmt_p(result$interaction$tests$p_value[2])`. This is not evidence of equivalence. Removing the proxy on the same sample gave p = `r fmt_p(result$interaction$sensitivity$p_value[1])`.
+
+```{r diabetes-contrasts, echo=FALSE}
+x <- result$interaction$odds
+kable(data.frame(Comparison=x$contrast,`OR / ratio of ORs (95% CI)`=ci_row(x),
+  `Raw p`=fmt_p(x$p_value),check.names=FALSE))
+```
+
+```{r diabetes-plot, echo=FALSE, fig.height=4.1}
+x <- result$interaction$prevalences
+x$vitamin_d_binary <- factor(x$vitamin_d_binary,levels=c("Adequate","Deficient"))
+x$diabetes <- factor(x$diabetes,levels=c("No diabetes","Diabetes"))
+p <- ggplot(x,aes(vitamin_d_binary,100*estimate,colour=model,group=model))+
+  geom_line(position=position_dodge(.25))+
+  geom_errorbar(aes(ymin=100*low,ymax=100*high),width=.12,position=position_dodge(.25))+
+  geom_point(size=2.6,position=position_dodge(.25))+
+  facet_wrap(~diabetes)+scale_colour_manual(values=palette)+
+  labs(x="Vitamin D: adequate >=50; deficient <50 nmol/L",
+    y="Standardised obesity prevalence (%)",colour=NULL,title="Vitamin D by diabetes status",
+    caption="Common proxy/age/sex distribution; pointwise 95% CIs. Sparse diabetic cells limit precision and support.")
+save_plot(p,"03_diabetes_comparison.png",10,4.1)
+```
+
+# Predictive performance and RF interpretation
+
+We used **two repeats of household-grouped nested CV** (5 outer × 3 inner folds), with identical participants and all five predictors, including diabetes, in GLM, GAM and RF. Tuning minimised weighted Brier score: GAM k ∈ {4, 6}; RF mtry ∈ {2, 4}, minimum node size ∈ {15, 40}, with `r params$rf_trees` trees in outer fits. Scores were evaluated with biomedical weights per complete repeat, then averaged. RF case weights affected tree sampling, not survey-design inference.
+
+```{r prediction-table, echo=FALSE}
+tab <- do.call(rbind,lapply(c("Logistic","GAM","RF","Null"),function(m) {
+  get <- function(z) ci_row(metric[metric$model==m & metric$metric==z,],4)
+  data.frame(Model=m,`Brier (95% CI)`=get("brier"),
+    `Log loss (95% CI)`=get("log_loss"),
+    `AUC (95% CI)`=if(m=="Null") "Not interpreted" else get("auc"),check.names=FALSE)
+}))
+kable(tab,caption="Conditional survey-replicate intervals for fixed held-out predictions; retraining and tuning uncertainty excluded.")
+```
+
+GLM had the lowest observed Brier score and log loss, and the highest AUC. GAM was close (Brier difference **`r sprintf("%.5f",metric_value("GAM","brier")-metric_value("Logistic","brier"))`**); RF performed worse in this comparison. GLM discrimination was modest (AUC `r sprintf("%.3f",metric_value("Logistic","auc"))`). These comparisons do not establish definitive model superiority, clinical prediction utility or validity of every GLM assumption.
+
+```{r calibration-plot, echo=FALSE, fig.width=11, fig.height=3.8}
+x <- result$prediction_summary$calibration
+p <- ggplot(x,aes(predicted,observed))+
+  geom_abline(intercept=0,slope=1,linetype=2,colour="grey55")+
+  geom_errorbar(aes(ymin=low,ymax=high),width=.008,colour="#246C7B")+
+  geom_line(colour="#246C7B")+geom_point(aes(size=n_predictions),colour="#246C7B")+
+  facet_wrap(~model,nrow=1)+coord_equal(xlim=c(0,1),ylim=c(0,1))+
+  scale_x_continuous(labels=function(z) paste0(round(100*z),"%"))+
+  scale_y_continuous(labels=function(z) paste0(round(100*z),"%"))+
+  labs(x="Predicted probability",y="Observed weighted prevalence",title="Held-out calibration",
+    caption="Ten pooled probability groups per model; conditional survey-replicate 95% CIs.")+
+  guides(size="none")
+save_plot(p,"05_calibration.png",11,3.8)
+```
+
+RF relied most on **age**, followed by the proxy and diabetes. Importance is the increase in held-out weighted Brier loss after uniform within-fold permutation (20 shuffles; original outcomes and recipient weights retained). It is predictive model reliance, not a significance test or causal effect.
+
+```{r rf-importance, echo=FALSE, fig.height=3.2}
+x <- result$rf_checks$importance
+p <- ggplot(x,aes(brier_increase,reorder(feature_label,brier_increase)))+
+  geom_vline(xintercept=0,colour="grey65",linetype="dashed")+
+  geom_point(size=3,colour=palette["RF"])+
+  labs(x="Increase in held-out Brier score",y=NULL,title="RF permutation importance",
+    caption="Mean across 20 permutations per fold and two complete validation repeats.")
+save_plot(p,"07_rf_permutation_importance.png",10,3.2)
+```
+
+# Conclusion and next steps
+
+We retain the **diabetes-adjusted logistic model as our baseline**: the evaluated GAM settings offered no predictive gain, and RF performed worse in this comparison. The k = 10 age sensitivity warrants expanding the **inner** GAM tuning grid in future validation; it was not part of this predictive comparison.
+
+Next, assess available confounders, missing-data/recall sensitivity and independent validation. Cross-sectional associations, complete-case selection, limited dietary measurement and the small diabetic subgroup constrain inference. The nutrient proxy cannot identify a food-processing effect.
+
+# Supplement
+
+<details>
+<summary>Higher-k GAM and RF partial-dependence curves</summary>
+
+```{r higher-k-plot, echo=FALSE, fig.width=11, fig.height=3.8}
+x <- result$model_checks$gam_k_curves
+x$setting <- factor(paste0("k = ",x$basis_k),levels=c("k = 6","k = 10"))
+x$predictor <- ifelse(x$variable=="age","Age (years)","Nutrient proxy (% energy)")
+p <- ggplot(x,aes(value,100*estimate,colour=setting,linetype=setting))+
+  geom_line(linewidth=.9)+facet_wrap(~predictor,scales="free_x")+
+  scale_colour_manual(values=c("#246C7B","#B34F2F"))+
+  scale_linetype_manual(values=c("solid","dashed"))+
+  labs(x=NULL,y="Standardised obesity prevalence (%)",colour=NULL,linetype=NULL,
+    title="GAM basis sensitivity",caption="Same participants, adjustment and central-90% grids; both bases refitted across all survey replicates.")
+save_plot(p,"06_gam_basis_sensitivity.png",11,3.8)
+```
+
+```{r rf-pdp, echo=FALSE, fig.width=11, fig.height=3.8}
+x <- result$rf_checks$pdp
+x$predictor <- ifelse(x$variable=="age","Age (years)","Nutrient proxy (% energy)")
+p <- ggplot(x,aes(value,predicted_prevalence_pct))+
+  geom_line(linewidth=.9,colour=palette["RF"])+facet_wrap(~predictor,scales="free_x")+
+  labs(x=NULL,y="Average predicted probability (%)",title="RF partial dependence",
+    caption="Cross-fitted and survey-weighted; central-90% grids. Descriptive curves without inferential bands.")
+save_plot(p,"08_rf_partial_dependence.png",11,3.8)
+```
+
+RF curves use held-out-fold models; GLM/GAM association curves use full-sample fits. Correlated predictors can yield unsupported combinations. Local RF fluctuations are not validated thresholds.
+
+</details>
+
+<details>
+<summary>Inference and reproducibility</summary>
+
+We used the biomedical weight and 60 supplied replicates, with variance factor 59/60. GLM coefficient CIs use residual survey df; marginal probabilities use pointwise logit-transformed replicate CIs. GAM smoothness is re-estimated in each replicate with a fixed basis. Nonlinearity uses a separate four-knot restricted-cubic-spline Wald test, not default GAM p-values. Holm adjustment covers the two main exposure tests (and separately the two nonlinearity components). Prediction CIs condition on fixed OOF predictions; folds are not treated as independent observations.
+
+```{r inference-code, eval=FALSE}
+# GLM coefficient CIs and p-values
+b <- coef(result$model)
+se <- sqrt(diag(vcov(result$model)))
+df <- result$model$df.residual
+# Match the table's age contrast (+10 years); proxy is already divided by 10.
+multiplier <- ifelse(names(b)=="age",10,1)
+b <- b*multiplier
+se <- se*multiplier
+OR_CI <- exp(cbind(OR=b,lower=b-qt(.975,df)*se,upper=b+qt(.975,df)*se))
+p <- 2*pt(abs(b/se),df,lower.tail=FALSE)
+survey::regTermTest(result$model,~vitamin_d,method="Wald")
+survey::regTermTest(result$interaction$primary,~vitamin_d_binary:diabetes,method="Wald")
+# Fixed-basis nonlinear terms and joint/component tests
+q2_nonlinearity(result$main_design)$tests
+# Marginal CIs: first row full-weight estimate; remaining rows replicate estimates
+q2_replicate_ci(estimates,df=survey::degf(result$main_design),transform="logit")
+```
+
+All implementation is embedded below. No helper scripts, cached models or existing result files are required. No raw data are modified.
+
+</details>
+
+# Reproducibility and complete code
+
+This single Rmd contains the cleaning, models, diagnostics, confidence intervals, p-values and figures. Open it in RStudio and select **Knit**. A full knit refits every model and may take several minutes.
+
+The only data inputs are `AHSnpa11bp.csv` and `AHSnpa11bb.csv`, normally in `../data/raw/` relative to this file. Set `params$data_dir` in the YAML header if they are elsewhere. Required packages are `rmarkdown`, `data.table`, `survey`, `mgcv`, `ranger`, `ggplot2` and `knitr`, plus Pandoc (included with RStudio). Optional aggregate CSV/PNG exports are off by default; set `export_results: true` to write them to `params$output_dir`.
+
+Use **Code → Download Rmd** for the complete source. The expandable sections below expose the calculations without repeating them in the narrative. The HTML embeds its figures and styling, but not participant records.
+
+<details>
+<summary>Runtime setup</summary>
+
+```{r appendix-setup, ref.label='setup', eval=FALSE, echo=TRUE}
+```
+
+</details>
+
+<details>
+<summary>Data cleaning, survey models and inference</summary>
+
+```{r appendix-analysis, ref.label='analysis-functions', eval=FALSE, echo=TRUE}
+```
+
+</details>
+
+<details>
+<summary>Household-grouped nested cross-validation</summary>
+
+```{r appendix-prediction, ref.label='prediction-functions', eval=FALSE, echo=TRUE}
+```
+
+</details>
+
+<details>
+<summary>Collinearity, influence and GAM sensitivity</summary>
+
+```{r appendix-diagnostics, ref.label='model-diagnostic-functions', eval=FALSE, echo=TRUE}
+```
+
+</details>
+
+<details>
+<summary>Held-out RF permutation importance and partial dependence</summary>
+
+```{r appendix-rf, ref.label='rf-diagnostic-functions', eval=FALSE, echo=TRUE}
+```
+
+</details>
+
+<details>
+<summary>Pipeline execution and optional aggregate exports</summary>
+
+```{r appendix-run, ref.label='run-analysis', eval=FALSE, echo=TRUE}
+```
+
+</details>
+
+<details>
+<summary>Display helpers and optional supplementary figure exports</summary>
+
+```{r appendix-display, ref.label='display-helpers', eval=FALSE, echo=TRUE}
+```
+
+</details>
+
+<details>
+<summary>Plot and table code</summary>
+
+```{r appendix-plots, ref.label=c('adjusted-associations','adjusted-curves','diagnostic-summary','diabetes-contrasts','diabetes-plot','prediction-table','calibration-plot','rf-importance','higher-k-plot','rf-pdp','additional-figure-exports'), eval=FALSE, echo=TRUE}
+```
+
+</details>
+
+<details>
+<summary>Source checksums and software versions</summary>
+
+```{r reproducibility-record, echo=FALSE}
+knitr::kable(data.frame(
+  File=basename(result$input$paths), MD5=result$input$hashes),
+  caption="Input checksums recorded before analysis and verified again afterwards.")
+```
+
+```{r session-information, echo=FALSE}
+sessionInfo()
+```
+
+</details>

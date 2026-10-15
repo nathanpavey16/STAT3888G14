@@ -1,0 +1,9 @@
+variable,knot,value
+upf_nutrient_proxy_pct10,1,0.973
+upf_nutrient_proxy_pct10,2,1.7430625
+upf_nutrient_proxy_pct10,3,2.359675
+upf_nutrient_proxy_pct10,4,3.5775875
+age,1,23
+age,2,39
+age,3,51
+age,4,62

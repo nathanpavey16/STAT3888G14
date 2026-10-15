@@ -1,0 +1,2 @@
+n,parameters,refits,cook_reference,leverage_reference,cook_above_reference,leverage_above_reference,max_cook,median_cook,max_leverage,auxiliary_max_coefficient_difference
+2616,7,5,0.00152905198776758,0.00535168195718654,233,310,0.18417912163468,6.73371829978485e-05,0.0758416735288885,0

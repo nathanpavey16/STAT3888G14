@@ -1,0 +1,7 @@
+item,description
+Collinearity,"Auxiliary normalized-biomedical-weight GLM coefficient-correlation GVIF, grouped by full model term. Model-based geometry, not survey inference. Adjusted GVIF is a root-VIF scale; no automatic variable deletion."
+Numeric correlation,"Unweighted Pearson and biomedical-prior-weighted Pearson for age/proxy; descriptive, not tests of independence or full-model collinearity."
+Influence screen,"Model-based approximate Cook distances/leverage from identical auxiliary GLM. Five largest Cook distances selected in advance; 4/n and 2p/n are heuristic references, not survey significance thresholds."
+Deletion sensitivity,Five independent single-person deletion svyglm refits using the original 60-replicate design. Main analysis unchanged. CI calculations condition on selected omissions; not formal tests of whether those records are invalid.
+GAM basis sensitivity,"Main k=6 versus k=10; 61 fixed-basis fits each, smoothing re-estimated. Common 25-point marginal grids and vitamin-D scenarios. Pointwise approximate replicate CIs and paired differences; no new held-out prediction claim."
+Dietary availability,Within-main-sample descriptive one- versus two-valid-day comparison using biomedical weights. Different exposure precision/sample composition; cannot diagnose or correct selection bias.

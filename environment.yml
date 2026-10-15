@@ -7,6 +7,8 @@ dependencies:
   - r-data.table
   - r-dplyr>=1.1
   - r-survey
+  - r-mgcv
+  - r-ranger
   - r-ggplot2
   - r-knitr
   - r-readxl

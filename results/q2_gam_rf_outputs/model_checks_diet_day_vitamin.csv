@@ -1,0 +1,7 @@
+group,vitamin_d,n,unweighted_pct,weighted_pct
+Day 1 only,Adequate,450,72.8155339805825,67.0691973269742
+Day 1 only,Mild deficiency,117,18.9320388349515,22.4028329631866
+Day 1 only,Moderate/severe deficiency,51,8.25242718446602,10.5279697098392
+Two valid days,Adequate,1562,78.1781781781782,75.1026917504619
+Two valid days,Mild deficiency,346,17.3173173173173,19.1763064230193
+Two valid days,Moderate/severe deficiency,90,4.50450450450451,5.72100182651877
