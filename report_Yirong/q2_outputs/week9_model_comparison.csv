@@ -1,0 +1,9 @@
+"Model","Formula","n","AIC","McFadden R2","ΔAIC vs best"
+"P1_crude","vitd3",2617,3077.9,0.001,130.5
+"P1_adj","vitd3 + age + sex",2617,3014.4,0.023,67
+"P2_crude","upf10",2617,3060.8,0.006,113.4
+"P2_adj","upf10 + age + sex",2617,2990.3,0.03,42.9
+"P3_crude","vitd3 + upf10",2617,3061.8,0.007,114.4
+"P3_adj","vitd3 + upf10 + age + sex",2617,2987.3,0.032,39.9
+"P4_main","vitd_def + diabetes + upf10 + age + sex",2617,2949.2,0.045,1.8
+"P4_int","vitd_def * diabetes + upf10 + age + sex",2617,2947.4,0.046,0

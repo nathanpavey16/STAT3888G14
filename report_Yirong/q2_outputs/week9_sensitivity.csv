@@ -1,0 +1,29 @@
+"Specification","Measure","Term","Estimate","p","unstable"
+"Main: P3 adjusted","OR","Vit D mild deficiency, 30–49 nmol/L (ref: adequate ≥50)","1.03 (0.70–1.51)","0.883",FALSE
+"Main: P3 adjusted","OR","Vit D moderate/severe deficiency, <30 nmol/L (ref: adequate)","2.72 (1.35–5.48)","0.006",FALSE
+"Main: P3 adjusted","OR","UPF proxy, per +10 % of energy","1.44 (1.24–1.68)","<0.001",FALSE
+"Main: P4 interaction","OR","Vit D deficient, <50 nmol/L (ref: adequate)","1.36 (0.98–1.89)","0.068",FALSE
+"Main: P4 interaction","OR","Diabetes (HbA1c) (ref: no diabetes)","3.19 (1.37–7.42)","0.008",FALSE
+"Main: P4 interaction","OR","UPF proxy, per +10 % of energy","1.43 (1.22–1.67)","<0.001",FALSE
+"Main: P4 interaction","OR","Interaction: Vit D deficient × Diabetes (ratio of ORs)","0.39 (0.08–1.94)","0.245",FALSE
+"Modified Poisson: P3","PR","Vit D mild deficiency, 30–49 nmol/L (ref: adequate ≥50)","1.02 (0.77–1.34)","0.908",FALSE
+"Modified Poisson: P3","PR","Vit D moderate/severe deficiency, <30 nmol/L (ref: adequate)","2.00 (1.27–3.16)","0.003",FALSE
+"Modified Poisson: P3","PR","UPF proxy, per +10 % of energy","1.29 (1.16–1.42)","<0.001",FALSE
+"Modified Poisson: P4","PR","Vit D deficient, <50 nmol/L (ref: adequate)","1.25 (0.98–1.58)","0.070",FALSE
+"Modified Poisson: P4","PR","Diabetes (HbA1c) (ref: no diabetes)","1.93 (1.31–2.84)","0.001",FALSE
+"Modified Poisson: P4","PR","UPF proxy, per +10 % of energy","1.28 (1.15–1.41)","<0.001",FALSE
+"Modified Poisson: P4","PR","Interaction: Vit D deficient × Diabetes (ratio of PRs)","0.59 (0.25–1.39)","0.222",FALSE
+"Extended confounders: P3","OR","Vit D mild deficiency, 30–49 nmol/L (ref: adequate ≥50)","1.02 (0.69–1.53)","0.910",FALSE
+"Extended confounders: P3","OR","Vit D moderate/severe deficiency, <30 nmol/L (ref: adequate)","2.63 (1.24–5.56)","0.013",FALSE
+"Extended confounders: P3","OR","UPF proxy, per +10 % of energy","1.46 (1.24–1.72)","<0.001",FALSE
+"Extended confounders: P4","OR","Vit D deficient, <50 nmol/L (ref: adequate)","1.34 (0.95–1.91)","0.098",FALSE
+"Extended confounders: P4","OR","Diabetes (HbA1c) (ref: no diabetes)","3.04 (1.31–7.05)","0.010",FALSE
+"Extended confounders: P4","OR","UPF proxy, per +10 % of energy","1.44 (1.22–1.70)","<0.001",FALSE
+"Extended confounders: P4","OR","Interaction: Vit D deficient × Diabetes (ratio of ORs)","0.44 (0.09–2.17)","0.304",FALSE
+"Waist outcome: P3","OR","Vit D mild deficiency, 30–49 nmol/L (ref: adequate ≥50)","1.29 (0.86–1.93)","0.211",FALSE
+"Waist outcome: P3","OR","Vit D moderate/severe deficiency, <30 nmol/L (ref: adequate)","2.46 (1.24–4.89)","0.011",FALSE
+"Waist outcome: P3","OR","UPF proxy, per +10 % of energy","1.30 (1.14–1.48)","<0.001",FALSE
+"Waist outcome: P4","OR","Vit D deficient, <50 nmol/L (ref: adequate)","1.44 (0.96–2.17)","0.076",FALSE
+"Waist outcome: P4","OR","Diabetes (HbA1c) (ref: no diabetes)","3.77 (1.08–13.09)","0.037",FALSE
+"Waist outcome: P4","OR","UPF proxy, per +10 % of energy","1.29 (1.13–1.48)","<0.001",FALSE
+"Waist outcome: P4","OR","Interaction: Vit D deficient × Diabetes (ratio of ORs)","3.01 (0.00–91600351676.42)","0.927",TRUE

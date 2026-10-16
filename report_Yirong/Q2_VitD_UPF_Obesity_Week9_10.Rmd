@@ -1,0 +1,831 @@
+---
+title: "Q2 – Vitamin D, ultra-processed food (UPF) proxy, diabetes and obesity"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: show
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 8, fig.height = 4.8, fig.align = "center")
+```
+
+# Setup
+
+**Before knitting:** put `AHSnpa11bp.csv` (person level) and `AHSnpa11bb.csv` (biomedical level)
+in the same folder as this `.Rmd` file, or change `data_dir` below. In RStudio, use
+*Session → Set Working Directory → To Source File Location*, then click **Knit**.
+
+```{r packages}
+pkgs <- c("dplyr", "tidyr", "ggplot2", "survey", "pROC", "car",
+          "knitr", "cluster", "MASS", "rpart", "class", "splines")
+missing_pkgs <- pkgs[!pkgs %in% rownames(installed.packages())]
+if (length(missing_pkgs) > 0) install.packages(missing_pkgs)
+
+library(dplyr); library(tidyr); library(ggplot2); library(survey)
+library(pROC); library(knitr); library(cluster)
+# MASS, rpart, class, car and splines are called with pkg:: so they don't mask dplyr::select
+
+data_dir <- "."          # folder containing the two CSV files
+out_dir  <- "q2_outputs" # tables are also saved here as CSV for the report
+dir.create(out_dir, showWarnings = FALSE)
+set.seed(3888)
+theme_set(theme_minimal(base_size = 12))
+```
+
+## Helper functions
+
+```{r helpers}
+fmt_p <- function(p) ifelse(is.na(p), "", ifelse(p < 0.001, "<0.001", sprintf("%.3f", p)))
+
+# Readable labels for model terms
+term_labels <- c(
+  "vitd3Mild"                          = "Vit D mild deficiency, 30–49 nmol/L (ref: adequate ≥50)",
+  "vitd3ModSevere"                     = "Vit D moderate/severe deficiency, <30 nmol/L (ref: adequate)",
+  "vitd_defDeficient"                  = "Vit D deficient, <50 nmol/L (ref: adequate)",
+  "diabetesDiabetes"                   = "Diabetes (HbA1c) (ref: no diabetes)",
+  "vitd_defDeficient:diabetesDiabetes" = "Interaction: Vit D deficient × Diabetes (ratio of ORs)",
+  "upf10"                              = "UPF proxy, per +10 % of energy",
+  "age"                                = "Age, per year",
+  "sexFemale"                          = "Female (ref: male)",
+  "energy_MJ"                          = "Total energy, per MJ/day",
+  "pa_hours"                           = "Physical activity, per hour/week",
+  "smokerEx"                           = "Ex-smoker (ref: never)",
+  "smokerCurrent"                      = "Current smoker (ref: never)"
+)
+lab <- function(x) ifelse(x %in% names(term_labels), term_labels[x], x)
+
+# Exponentiated coefficients with Wald CIs.
+# For svyglm the t distribution uses the design degrees of freedom.
+tidy_or <- function(fit) {
+  s  <- summary(fit)
+  ct <- s$coefficients
+  df <- if (inherits(fit, "svyglm")) s$df.residual else Inf
+  crit <- qt(0.975, df)
+  data.frame(term = rownames(ct),
+             est  = exp(ct[, 1]),
+             lo   = exp(ct[, 1] - crit * ct[, 2]),
+             hi   = exp(ct[, 1] + crit * ct[, 2]),
+             p    = ct[, 4], row.names = NULL)
+}
+
+# Table of ORs for several fitted models (one column per model)
+or_compare <- function(fits) {
+  rows <- lapply(names(fits), function(m) {
+    tidy_or(fits[[m]]) %>% filter(term != "(Intercept)") %>%
+      transmute(term, model = m,
+                value = sprintf("%.2f (%.2f–%.2f); p=%s", est, lo, hi, fmt_p(p)))
+  })
+  bind_rows(rows) %>%
+    pivot_wider(names_from = model, values_from = value, values_fill = "—") %>%
+    mutate(term = lab(term)) %>% rename(Term = term)
+}
+
+# One-line summary of a single term, for use in the text
+or_txt <- function(fit, term, what = "OR") {
+  r <- tidy_or(fit) %>% filter(.data$term == !!term)
+  sprintf("%s = %.2f (95%% CI %.2f–%.2f, p = %s)", what, r$est, r$lo, r$hi, fmt_p(r$p))
+}
+p_of   <- function(fit, term) tidy_or(fit) %>% filter(.data$term == !!term) %>% pull(p)
+sigtxt <- function(p) ifelse(p < 0.05, "statistically significant", "not statistically significant")
+
+# % change in the exposure OR when confounders are added (>10% = meaningful confounding)
+pct_change <- function(crude, adj, term) {
+  a <- tidy_or(crude) %>% filter(.data$term == !!term) %>% pull(est)
+  b <- tidy_or(adj)   %>% filter(.data$term == !!term) %>% pull(est)
+  100 * (b - a) / a
+}
+
+# Unweighted glm summaries used for AIC / likelihood-ratio tests / pseudo-R2
+glm_fit <- function(f, data) glm(f, data = data, family = binomial)
+# McFadden pseudo-R2 = 1 - logL(model)/logL(null); for 0/1 data this equals 1 - deviance/null deviance
+mcfadden <- function(fit) 1 - fit$deviance / fit$null.deviance
+
+brier <- function(y, p) mean((y - p)^2)
+mk_roc <- function(y, p) pROC::roc(response = y, predictor = p,
+                                   levels = c(0, 1), direction = "<", quiet = TRUE)
+
+# Hosmer–Lemeshow goodness-of-fit test (implemented here so no extra package is needed)
+hosmer_lemeshow <- function(y, p, g = 10) {
+  br  <- unique(quantile(p, probs = seq(0, 1, length.out = g + 1)))
+  grp <- cut(p, br, include.lowest = TRUE)
+  obs <- tapply(y, grp, sum); expd <- tapply(p, grp, sum); n <- tapply(y, grp, length)
+  stat <- sum((obs - expd)^2 / (expd * (1 - expd / n)))
+  df <- length(n) - 2
+  c(statistic = stat, df = df, p.value = pchisq(stat, df, lower.tail = FALSE))
+}
+
+# Adjusted Rand index between two labelings (cluster vs obesity)
+adj_rand <- function(a, b) {
+  tab <- table(a, b); n <- sum(tab)
+  sc <- sum(choose(tab, 2)); sa <- sum(choose(rowSums(tab), 2)); sb <- sum(choose(colSums(tab), 2))
+  expct <- sa * sb / choose(n, 2)
+  (sc - expct) / ((sa + sb) / 2 - expct)
+}
+
+save_tab <- function(df, name) write.csv(df, file.path(out_dir, paste0(name, ".csv")), row.names = FALSE)
+```
+
+# Data preparation
+
+## Read and merge
+
+The person file and biomedical file share the selected-person identifier `ABSPID` (one row per person in each file).
+
+```{r read}
+bp_cols <- c("ABSHID", "ABSPID", "AGEC", "SEX", "FEMLSBC", "BMISC", "PHDCMWBC",
+             "SATPER1", "PEADDSD1", "ENERGYT1", "EXLWTBC", "SMKSTAT", "NPAFINWT")
+bb_cols <- c("ABSPID", "BIORESPC", "VDLCMRGT", "DIABPRVE", "NHMSPERW",
+             sprintf("RPWGT%02d", 1:60))
+
+bp <- read.csv(file.path(data_dir, "AHSnpa11bp.csv"))[, bp_cols]
+bb <- read.csv(file.path(data_dir, "AHSnpa11bb.csv"))[, bb_cols]
+
+stopifnot(!anyDuplicated(bp$ABSPID), !anyDuplicated(bb$ABSPID))
+raw <- left_join(bp, bb, by = "ABSPID")
+c(person_rows = nrow(bp), biomedical_rows = nrow(bb), merged = nrow(raw))
+```
+
+## Recode variables (codes from the NNPAS Basic CURF data item list)
+
+| Variable | Source | Coding used |
+|---|---|---|
+| `obese` | `BMISC` | 1 if measured BMI ≥ 30; codes 0/98/99 (not applicable / not measured / not known) → missing |
+| `vitd3` | `VDLCMRGT` | 1 Adequate ≥50 nmol/L, 2 Mild 30–49, 3 Moderate/severe <30; 0/8 → missing |
+| `vitd_def` | `VDLCMRGT` | Deficient (<50 nmol/L) vs adequate — used for the interaction because cells are small |
+| `diabetes` | `DIABPRVE` | Diabetes = 1 known or 2 newly diagnosed; No diabetes = 3 normal or 4 at risk; 0/8 → missing |
+| `upf` | `SATPER1 + PEADDSD1` | % energy from saturated + trans fat + % energy from added sugars (Day 1); modelled per 10 %E |
+| `age`, `sex` | `AGEC`, `SEX` | Confounders |
+| Restriction | `AGEC`, `FEMLSBC` | Age 18–64; currently pregnant women (`FEMLSBC` = 2) excluded |
+| Sensitivity only | `PHDCMWBC`, `ENERGYT1`, `EXLWTBC`, `SMKSTAT` | Waist-based obesity, energy, physical activity, smoking |
+
+```{r recode}
+dat <- raw %>%
+  filter(AGEC >= 18, AGEC <= 64, FEMLSBC != 2) %>%
+  mutate(
+    BMI      = ifelse(BMISC > 0 & BMISC < 97, BMISC, NA),
+    obese    = as.integer(BMI >= 30),
+    obese_f  = factor(obese, 0:1, c("Not obese", "Obese")),
+    age      = AGEC,
+    sex      = factor(SEX, 1:2, c("Male", "Female")),
+    vitd_score = ifelse(VDLCMRGT %in% 1:3, VDLCMRGT, NA),       # 1 adequate … 3 mod/severe
+    vitd3    = factor(vitd_score, 1:3, c("Adequate", "Mild", "ModSevere")),
+    vitd_def = factor(ifelse(is.na(vitd_score), NA, as.integer(vitd_score >= 2)),
+                      0:1, c("Adequate", "Deficient")),
+    diabetes = factor(ifelse(DIABPRVE %in% 1:4, as.integer(DIABPRVE <= 2), NA),
+                      0:1, c("No diabetes", "Diabetes")),
+    upf      = SATPER1 + PEADDSD1,
+    upf10    = upf / 10,
+    waist    = ifelse(PHDCMWBC > 0 & PHDCMWBC < 998, PHDCMWBC, NA),
+    waist_obese = as.integer((sex == "Male" & waist >= 94) | (sex == "Female" & waist >= 80)),
+    energy_MJ = ENERGYT1 / 1000,
+    pa_hours  = ifelse(EXLWTBC <= 2100, EXLWTBC / 60, NA),        # 9996/9999 → missing
+    smoker    = factor(case_when(SMKSTAT %in% 1:3 ~ "Current", SMKSTAT == 4 ~ "Ex",
+                                 SMKSTAT == 5 ~ "Never"), levels = c("Never", "Ex", "Current"))
+  )
+
+# Analysis samples (complete cases)
+d_full <- dat %>% filter(!is.na(obese), !is.na(upf))                       # UPF analysis (Person 2)
+d_bio  <- d_full %>% filter(!is.na(vitd3), !is.na(diabetes), NHMSPERW > 0)  # Vit D analyses (Persons 1, 3, 4 & Week 10)
+
+sample_flow <- data.frame(
+  Step = c("Merged NNPAS records", "Aged 18–64 and not pregnant",
+           "+ valid measured BMI and UPF proxy (Person 2 sample)",
+           "+ valid vitamin D and HbA1c diabetes status (Persons 1, 3, 4; Week 10)"),
+  n = c(nrow(raw), nrow(dat), nrow(d_full), nrow(d_bio)))
+kable(sample_flow, caption = "Sample flow")
+```
+
+> Persons 1, 3 and 4 all use the **same** biomedical sample (n = `r nrow(d_bio)`), so their models are nested
+> and can be compared directly with likelihood-ratio tests and AIC. Person 2 is fitted in the larger
+> full sample (n = `r nrow(d_full)`) and re-fitted in the biomedical sample for comparison with Person 3.
+
+## Survey designs
+
+Population estimates use the ABS weights. The biomedical file supplies 60 delete-a-group jackknife replicate
+weights (`RPWGT01–60`), which give design-based standard errors. The person file has no replicate weights, so the
+full-sample design uses the person weight only.
+
+```{r designs}
+des_full <- svydesign(ids = ~1, weights = ~NPAFINWT, data = d_full)
+des_bio  <- svrepdesign(data = d_bio, weights = ~NHMSPERW,
+                        repweights = "RPWGT[0-9]+", type = "JK1",
+                        scale = 59 / 60, mse = TRUE)
+```
+
+## Descriptive overview
+
+```{r descriptives}
+prev_by <- function(var, design) {
+  r <- svyby(~obese, as.formula(paste0("~", var)), design, svymean, na.rm = TRUE)
+  n <- table(design$variables[[var]])
+  data.frame(Variable = var, Group = as.character(r[[var]]),
+             n = as.integer(n[as.character(r[[var]])]),
+             `Weighted obesity %` = sprintf("%.1f (SE %.1f)", 100 * r$obese, 100 * SE(r)),
+             check.names = FALSE)
+}
+d_bio$upf_q  <- cut(d_bio$upf,  quantile(d_bio$upf,  0:4 / 4), include.lowest = TRUE, labels = paste0("Q", 1:4))
+d_full$upf_q <- cut(d_full$upf, quantile(d_full$upf, 0:4 / 4), include.lowest = TRUE, labels = paste0("Q", 1:4))
+des_bio  <- update(des_bio,  upf_q = d_bio$upf_q)
+des_full <- update(des_full, upf_q = d_full$upf_q)
+
+desc_tab <- bind_rows(prev_by("vitd3", des_bio), prev_by("diabetes", des_bio),
+                      prev_by("sex", des_bio), prev_by("upf_q", des_full))
+kable(desc_tab, caption = "Survey-weighted obesity prevalence by group (unadjusted)")
+save_tab(desc_tab, "table1_weighted_prevalence")
+
+kable(table(VitaminD = d_bio$vitd3, Diabetes = d_bio$diabetes),
+      caption = "Cell counts: vitamin D × diabetes (why the interaction uses binary deficiency)")
+```
+
+```{r eda-plot, fig.height=4}
+ggplot(d_full, aes(upf, BMI)) +
+  geom_point(alpha = 0.15, size = 0.8) +
+  geom_smooth(method = "loess", se = TRUE, colour = "firebrick") +
+  geom_hline(yintercept = 30, linetype = "dashed") +
+  labs(x = "UPF proxy (% energy from sat/trans fat + added sugar)", y = "Measured BMI",
+       title = "BMI against the UPF proxy (dashed line = obesity threshold)")
+```
+
+# Week 9 – Model building and significance of the independent variables
+
+All models are logistic regressions for `logit P(Obese = 1)`. For each person we report:
+
+* **Survey-weighted ORs** (`svyglm`, quasibinomial, replicate-weight SEs) — the primary, population-level result;
+* the **joint Wald test** for multi-level factors (`regTermTest`);
+* **unweighted `glm` likelihood-ratio tests and AIC**, used for model comparison;
+* the **% change in the exposure OR** after adjustment (a change of more than 10% suggests confounding by age/sex).
+
+```{r fit-all}
+f <- list(
+  P1_crude = obese ~ vitd3,
+  P1_adj   = obese ~ vitd3 + age + sex,
+  P2_crude = obese ~ upf10,
+  P2_adj   = obese ~ upf10 + age + sex,
+  P3_crude = obese ~ vitd3 + upf10,
+  P3_adj   = obese ~ vitd3 + upf10 + age + sex,
+  P4_main  = obese ~ vitd_def + diabetes + upf10 + age + sex,
+  P4_int   = obese ~ vitd_def * diabetes + upf10 + age + sex   # = the full model in the brief
+)
+
+# Survey-weighted fits (biomedical design for everything except Person 2 primary)
+sw <- lapply(f, function(ff) svyglm(ff, design = des_bio, family = quasibinomial()))
+sw$P2_crude_full <- svyglm(f$P2_crude, design = des_full, family = quasibinomial())
+sw$P2_adj_full   <- svyglm(f$P2_adj,   design = des_full, family = quasibinomial())
+
+# Unweighted fits (same biomedical sample) for LRT / AIC
+uw <- lapply(f, glm_fit, data = d_bio)
+uw$P2_crude_full <- glm_fit(f$P2_crude, d_full)
+uw$P2_adj_full   <- glm_fit(f$P2_adj,   d_full)
+```
+
+## Person 1 – Obesity ~ Vitamin D
+
+```{r p1}
+kable(or_compare(list(`Crude (weighted)` = sw$P1_crude, `Adjusted (weighted)` = sw$P1_adj,
+                      `Adjusted (unweighted)` = uw$P1_adj)),
+      caption = "Person 1: odds ratios (95% CI); p")
+
+p1_joint_c <- regTermTest(sw$P1_crude, ~vitd3)
+p1_joint_a <- regTermTest(sw$P1_adj,   ~vitd3)
+p1_lrt     <- drop1(uw$P1_adj, test = "LRT")
+kable(data.frame(Test = c("Joint Wald F, vitamin D (crude, weighted)",
+                          "Joint Wald F, vitamin D (adjusted, weighted)",
+                          "Likelihood-ratio χ², vitamin D (adjusted, unweighted)"),
+                 p = fmt_p(c(p1_joint_c$p, p1_joint_a$p, p1_lrt["vitd3", "Pr(>Chi)"]))),
+      caption = "Overall significance of vitamin D (2 df)")
+```
+
+**Interpretation (auto-filled).** After adjusting for age and sex, moderate/severe deficiency had
+`r or_txt(sw$P1_adj, "vitd3ModSevere")` and mild deficiency had `r or_txt(sw$P1_adj, "vitd3Mild")` compared
+with adequate vitamin D. The overall vitamin D effect was `r sigtxt(p1_joint_a$p)` (joint p = `r fmt_p(p1_joint_a$p)`).
+Adjustment changed the moderate/severe OR by `r sprintf("%.1f", pct_change(sw$P1_crude, sw$P1_adj, "vitd3ModSevere"))`%
+and the mild OR by `r sprintf("%.1f", pct_change(sw$P1_crude, sw$P1_adj, "vitd3Mild"))`%.
+
+*Discussion prompts:* direction of the association (lower vitamin D ↔ higher odds of obesity is consistent with
+vitamin D being sequestered in adipose tissue, i.e. obesity may cause low vitamin D rather than the reverse);
+the cross-sectional design cannot establish causality; the season of the blood test is not adjusted for.
+
+## Person 2 – Obesity ~ UPF proxy
+
+```{r p2}
+kable(or_compare(list(`Crude, full sample` = sw$P2_crude_full, `Adjusted, full sample` = sw$P2_adj_full,
+                      `Crude, biomedical sample` = sw$P2_crude, `Adjusted, biomedical sample` = sw$P2_adj)),
+      caption = "Person 2: odds ratios per +10 % energy from the UPF proxy (weighted)")
+p2_lrt <- drop1(uw$P2_adj_full, test = "LRT")
+```
+
+**Interpretation (auto-filled).** In the full sample (n = `r nrow(d_full)`), each additional 10 % of energy from
+saturated/trans fat plus added sugar had `r or_txt(sw$P2_adj_full, "upf10")` after adjusting for age and sex
+(likelihood-ratio p = `r fmt_p(p2_lrt["upf10", "Pr(>Chi)"])`), which is `r sigtxt(p_of(sw$P2_adj_full, "upf10"))`.
+Adjustment changed the OR by `r sprintf("%.1f", pct_change(sw$P2_crude_full, sw$P2_adj_full, "upf10"))`%.
+
+*Discussion prompts:* the proxy comes from a single 24-hour recall, so day-to-day variation dilutes the association
+towards OR = 1; people with obesity may under-report energy-dense foods (reporting bias); the proxy measures
+nutrients, not processing level (NOVA), so it is only an indirect UPF marker.
+
+## Person 3 – Obesity ~ Vitamin D + UPF
+
+```{r p3}
+kable(or_compare(list(`Vit D only (adj.)` = sw$P1_adj, `UPF only (adj.)` = sw$P2_adj,
+                      `Both, crude` = sw$P3_crude, `Both, adjusted` = sw$P3_adj)),
+      caption = "Person 3: mutual adjustment (all in the biomedical sample, weighted)")
+
+p3_joint <- regTermTest(sw$P3_adj, ~vitd3)
+p3_lrt   <- drop1(uw$P3_adj, test = "LRT")
+kable(data.frame(Term = c("Vitamin D (2 df)", "UPF proxy (1 df)"),
+                 `LRT p (unweighted)` = fmt_p(p3_lrt[c("vitd3", "upf10"), "Pr(>Chi)"]),
+                 `Wald p (weighted)`  = fmt_p(c(p3_joint$p, p_of(sw$P3_adj, "upf10"))),
+                 check.names = FALSE),
+      caption = "Significance of each exposure in the mutually adjusted model")
+
+# Are the two exposures related? (if not, mutual adjustment should change little)
+upf_by_vitd <- svyby(~upf, ~vitd3, des_bio, svymean)
+kable(data.frame(`Vitamin D` = upf_by_vitd$vitd3, `Weighted mean UPF %E` = round(upf_by_vitd$upf, 1),
+                 SE = round(SE(upf_by_vitd), 2), check.names = FALSE),
+      caption = sprintf("UPF proxy by vitamin D group (design-based Wald test p = %s)",
+                        fmt_p(regTermTest(svyglm(upf ~ vitd3, des_bio), ~vitd3)$p)))
+kable(round(car::vif(uw$P3_adj), 2), caption = "Generalised VIF (values < 2 indicate no collinearity problem)")
+```
+
+**Interpretation (auto-filled).** With both exposures in the model, moderate/severe vitamin D deficiency had
+`r or_txt(sw$P3_adj, "vitd3ModSevere")` and the UPF proxy had `r or_txt(sw$P3_adj, "upf10")`.
+Compared with the single-exposure models, the vitamin D OR changed by
+`r sprintf("%.1f", pct_change(sw$P1_adj, sw$P3_adj, "vitd3ModSevere"))`% and the UPF OR by
+`r sprintf("%.1f", pct_change(sw$P2_adj, sw$P3_adj, "upf10"))`%, i.e. the two exposures act largely
+`r ifelse(abs(pct_change(sw$P1_adj, sw$P3_adj, "vitd3ModSevere")) < 10 & abs(pct_change(sw$P2_adj, sw$P3_adj, "upf10")) < 10, "independently", "non-independently (they share part of their association)")`.
+
+*Discussion prompts (bigger discussion):* compare the UPF OR in the full vs biomedical sample (precision is lost in the
+smaller sample, and blood-test participants may differ from non-participants); whether diet is on the causal path to
+low vitamin D (if so, adjusting for it would be over-adjustment); residual confounding by physical activity, sun
+exposure and socioeconomic status (see Sensitivity analyses).
+
+## Person 4 – Interaction of diabetes and vitamin D on obesity
+
+Full model from the brief:
+$\text{logit}\,P(\text{Obese}) = \beta_0 + \beta_1\text{VitD} + \beta_2\text{Diabetes} + \beta_3(\text{VitD}\times\text{Diabetes}) + \beta_4\text{UPF} + \beta_5\text{Age} + \beta_6\text{Sex}$.
+Vitamin D is used as *deficient vs adequate* because only `r sum(d_bio$diabetes == "Diabetes" & d_bio$vitd3 == "ModSevere")`
+people with diabetes have moderate/severe deficiency.
+
+```{r p4}
+kable(or_compare(list(`Main effects` = sw$P4_main, `With interaction` = sw$P4_int)),
+      caption = "Person 4: weighted odds ratios")
+
+int_term <- "vitd_defDeficient:diabetesDiabetes"
+p4_wald  <- regTermTest(sw$P4_int, ~vitd_def:diabetes)
+p4_lrt   <- anova(uw$P4_main, uw$P4_int, test = "LRT")
+
+# Stratum-specific ORs for vitamin D deficiency
+strat <- svycontrast(sw$P4_int, list(
+  `No diabetes` = c("vitd_defDeficient" = 1),
+  `Diabetes`    = c("vitd_defDeficient" = 1, "vitd_defDeficient:diabetesDiabetes" = 1)))
+ddf <- summary(sw$P4_int)$df.residual
+strat_tab <- data.frame(Group = names(coef(strat)), n = as.integer(table(d_bio$diabetes)),
+                        `OR for Vit D deficiency` = sprintf("%.2f (%.2f–%.2f)",
+                          exp(coef(strat)), exp(coef(strat) - qt(.975, ddf) * SE(strat)),
+                          exp(coef(strat) + qt(.975, ddf) * SE(strat))),
+                        p = fmt_p(2 * pt(-abs(coef(strat) / SE(strat)), ddf)),
+                        check.names = FALSE, row.names = NULL)
+kable(strat_tab, caption = "Effect of vitamin D deficiency within each diabetes group")
+
+kable(data.frame(Test = c("Wald F for interaction (weighted)", "LRT main vs interaction (unweighted)"),
+                 p = fmt_p(c(p4_wald$p, p4_lrt$`Pr(>Chi)`[2]))),
+      caption = "Is the vitamin D–obesity association different by diabetes status?")
+```
+
+```{r p4-standardised, fig.height=4}
+# Age/sex/UPF-standardised obesity prevalence for each Vit D × diabetes combination,
+# with jackknife SEs from the 60 replicate weights.
+combos <- expand.grid(vitd_def = levels(d_bio$vitd_def), diabetes = levels(d_bio$diabetes))
+std_prev <- withReplicates(des_bio, function(w, data) {
+  data$rep_w <- w / mean(w)            # rescale to mean 1 (as svyglm does) so IRLS converges
+  fit <- glm(f$P4_int, data = data, weights = rep_w, family = quasibinomial())
+  sapply(seq_len(nrow(combos)), function(i) {
+    nd <- data; nd$vitd_def <- combos$vitd_def[i]; nd$diabetes <- combos$diabetes[i]
+    nd$vitd_def <- factor(nd$vitd_def, levels(d_bio$vitd_def))
+    nd$diabetes <- factor(nd$diabetes, levels(d_bio$diabetes))
+    weighted.mean(predict(fit, nd, type = "response"), w)
+  })
+})
+combos$prev <- as.numeric(coef(std_prev)); combos$se <- as.numeric(SE(std_prev))
+
+ggplot(combos, aes(vitd_def, 100 * prev, colour = diabetes, group = diabetes)) +
+  geom_point(size = 3, position = position_dodge(0.3)) +
+  geom_line(position = position_dodge(0.3)) +
+  geom_errorbar(aes(ymin = 100 * (prev - 1.96 * se), ymax = 100 * (prev + 1.96 * se)),
+                width = 0.15, position = position_dodge(0.3)) +
+  labs(x = "Vitamin D status", y = "Standardised obesity prevalence (%)", colour = NULL,
+       title = "Model-standardised obesity prevalence (full interaction model)",
+       subtitle = "Non-parallel lines suggest interaction, but check the wide CIs in the diabetes group")
+```
+
+**Interpretation (auto-filled).** The interaction term was `r or_txt(sw$P4_int, int_term, "ratio of ORs")`;
+the LRT comparing models with and without the interaction gave p = `r fmt_p(p4_lrt[["Pr(>Chi)"]][2])`.
+This is `r sigtxt(p4_wald$p)`, so we `r ifelse(p4_wald$p < 0.05, "have", "do not have")` evidence that
+the vitamin D–obesity association differs between people with and without diabetes. Only
+`r sum(d_bio$diabetes == "Diabetes")` participants have diabetes, so the test has low power and the
+diabetic-group estimate is imprecise.
+
+## Model comparison and diagnostics (Week 9 summary)
+
+```{r w9-compare}
+cmp_names <- c("P1_crude", "P1_adj", "P2_crude", "P2_adj", "P3_crude", "P3_adj", "P4_main", "P4_int")
+w9 <- data.frame(Model = cmp_names,
+                 Formula = sapply(f[cmp_names], function(x) deparse(x[[3]])),
+                 n = sapply(uw[cmp_names], nobs),
+                 AIC = round(sapply(uw[cmp_names], AIC), 1),
+                 `McFadden R2` = round(sapply(uw[cmp_names], mcfadden), 3), check.names = FALSE)
+w9$`ΔAIC vs best` <- round(w9$AIC - min(w9$AIC), 1)
+kable(w9, caption = "Model comparison in the common biomedical sample (unweighted glm)")
+save_tab(w9, "week9_model_comparison")
+
+# Nested likelihood-ratio tests along the model-building path
+nested <- list(c("P1_crude", "P1_adj"), c("P2_crude", "P2_adj"), c("P1_adj", "P3_adj"),
+               c("P2_adj", "P3_adj"), c("P4_main", "P4_int"))
+# P3_adj vs P4_* are not nested (vitamin D is coded in 3 levels vs 2), so compare them with AIC only.
+lrt_tab <- do.call(rbind, lapply(nested, function(m) {
+  a <- anova(uw[[m[1]]], uw[[m[2]]], test = "LRT")
+  data.frame(Comparison = paste(m[1], "→", m[2]), df = a$Df[2],
+             `LR χ²` = round(a$Deviance[2], 2), p = fmt_p(a$`Pr(>Chi)`[2]), check.names = FALSE)
+}))
+kable(lrt_tab, caption = "Likelihood-ratio tests: does adding the extra term(s) improve fit?")
+
+# Combined weighted OR table for the report
+all_or <- or_compare(list(P1_adj = sw$P1_adj, P2_adj_full = sw$P2_adj_full,
+                          P3_adj = sw$P3_adj, P4_int = sw$P4_int))
+save_tab(all_or, "week9_adjusted_odds_ratios")
+```
+
+```{r diagnostics}
+# 1) Linearity of continuous terms on the logit scale: linear vs natural spline (3 df)
+lin_check <- data.frame(
+  Term = c("Age", "UPF proxy"),
+  `LRT p (spline vs linear)` = fmt_p(c(
+    anova(uw$P3_adj, glm_fit(obese ~ vitd3 + upf10 + splines::ns(age, 3) + sex, d_bio),
+          test = "LRT")$`Pr(>Chi)`[2],
+    anova(uw$P3_adj, glm_fit(obese ~ vitd3 + splines::ns(upf10, 3) + age + sex, d_bio),
+          test = "LRT")$`Pr(>Chi)`[2])),
+  check.names = FALSE)
+kable(lin_check, caption = "Linearity check (p < 0.05 would suggest a non-linear term is needed)")
+
+# 2) Influential observations
+cd <- cooks.distance(uw$P4_int)
+c(`max Cook's distance` = round(max(cd), 4), `n with D > 4/n` = sum(cd > 4 / length(cd)))
+```
+
+## Sensitivity analyses
+
+1. **Prevalence ratios** (modified Poisson, log link, robust/replicate SEs) as planned in the proposal — ORs
+   exaggerate risk ratios when the outcome is common (~27% here).
+2. **Extended confounders**: + total energy, physical activity and smoking.
+3. **Alternative outcome**: waist-circumference obesity (≥94 cm men, ≥80 cm women).
+
+```{r sensitivity}
+key_terms <- c("vitd3Mild", "vitd3ModSevere", "upf10", "vitd_defDeficient",
+               "diabetesDiabetes", int_term)
+pull_terms <- function(fit, spec, measure) tidy_or(fit) %>% filter(term %in% key_terms) %>%
+  transmute(Specification = spec, Measure = measure, Term = lab(term),
+            Term = sub("ratio of ORs", paste0("ratio of ", measure, "s"), Term),
+            Estimate = sprintf("%.2f (%.2f–%.2f)", est, lo, hi), p = fmt_p(p),
+            unstable = hi / lo > 1000)   # flags terms that are not estimable
+
+start_vals <- function(ff, data) c(log(mean(data$obese)), rep(0, ncol(model.matrix(ff, data)) - 1))
+des_pa    <- subset(des_bio, !is.na(pa_hours) & !is.na(smoker))
+des_waist <- subset(des_bio, !is.na(waist_obese))
+f_ext3 <- update(f$P3_adj, . ~ . + energy_MJ + pa_hours + smoker)
+f_ext4 <- update(f$P4_int, . ~ . + energy_MJ + pa_hours + smoker)
+
+sens <- bind_rows(
+  pull_terms(sw$P3_adj, "Main: P3 adjusted", "OR"),
+  pull_terms(sw$P4_int, "Main: P4 interaction", "OR"),
+  pull_terms(svyglm(f$P3_adj, des_bio, family = quasipoisson(link = "log"),
+                    start = start_vals(f$P3_adj, d_bio)), "Modified Poisson: P3", "PR"),
+  pull_terms(svyglm(f$P4_int, des_bio, family = quasipoisson(link = "log"),
+                    start = start_vals(f$P4_int, d_bio)), "Modified Poisson: P4", "PR"),
+  pull_terms(svyglm(f_ext3, des_pa, family = quasibinomial()), "Extended confounders: P3", "OR"),
+  pull_terms(svyglm(f_ext4, des_pa, family = quasibinomial()), "Extended confounders: P4", "OR"),
+  pull_terms(svyglm(update(f$P3_adj, waist_obese ~ .), des_waist, family = quasibinomial()),
+             "Waist outcome: P3", "OR"),
+  pull_terms(svyglm(update(f$P4_int, waist_obese ~ .), des_waist, family = quasibinomial()),
+             "Waist outcome: P4", "OR"))
+kable(sens %>% select(-unstable), caption = "Key estimates under alternative specifications (survey-weighted)")
+save_tab(sens, "week9_sensitivity")
+waist_cells <- with(subset(d_bio, !is.na(waist_obese)),
+                    table(VitD = vitd_def, Diabetes = diabetes, `Waist obese` = waist_obese))
+```
+
+`r if (any(sens$unstable)) paste0("**Note:** the following estimate(s) have extremely wide CIs and should be reported as *not estimable*: ", paste(paste0(sens$Specification[sens$unstable], " – ", sens$Term[sens$unstable]), collapse = "; "), ". For the waist outcome this is quasi-complete separation: almost everyone with diabetes meets the waist threshold (only ", waist_cells["Deficient", "Diabetes", "0"], " vitamin D-deficient participant(s) with diabetes are below it).") else ""`
+
+# Week 10 – Testing the prediction of the models
+
+Prediction is assessed on the common biomedical sample (n = `r nrow(d_bio)`) with unweighted models, because the
+question is how well each model classifies *individuals*.
+
+* **Hold-out test:** stratified 70/30 train/test split; models are fitted on the training set and scored on the test set.
+* **Repeated 10-fold cross-validation** (5 repeats) gives a more stable estimate of out-of-sample AUC and Brier score.
+* **Metrics:** AUC (discrimination, DeLong 95% CI), Brier score (overall accuracy of probabilities), sensitivity,
+  specificity, PPV, NPV and accuracy. The classification threshold is chosen on the *training* data
+  (Youden index) to avoid leakage. Calibration is checked with the Hosmer–Lemeshow test and a calibration plot.
+* **Other methods:** LDA, a classification tree and k-nearest neighbours, plus **K-means** clustering (unsupervised).
+
+```{r split}
+d_pred <- d_bio
+idx_train <- unlist(lapply(split(seq_len(nrow(d_pred)), d_pred$obese),
+                           function(i) sample(i, round(0.7 * length(i)))))
+train <- d_pred[idx_train, ]; test <- d_pred[-idx_train, ]
+kable(data.frame(Set = c("Train", "Test"), n = c(nrow(train), nrow(test)),
+                 `Obese %` = round(100 * c(mean(train$obese), mean(test$obese)), 1), check.names = FALSE),
+      caption = "Stratified 70/30 split")
+
+f_pred <- c(list(M0_AgeSex = obese ~ age + sex), f[cmp_names])
+```
+
+## Hold-out test-set performance
+
+```{r holdout}
+eval_model <- function(ff, name) {
+  fit   <- glm(ff, data = train, family = binomial)
+  p_tr  <- predict(fit, train, type = "response")
+  p_te  <- predict(fit, test,  type = "response")
+  thr   <- pROC::coords(mk_roc(train$obese, p_tr), "best", best.method = "youden",
+                        ret = "threshold", transpose = FALSE)$threshold[1]
+  r     <- mk_roc(test$obese, p_te); ci <- pROC::ci.auc(r)
+  pred  <- as.integer(p_te >= thr); y <- test$obese
+  tp <- sum(pred == 1 & y == 1); tn <- sum(pred == 0 & y == 0)
+  fp <- sum(pred == 1 & y == 0); fn <- sum(pred == 0 & y == 1)
+  list(roc = r, p = p_te,
+       row = data.frame(Model = name,
+                        AUC = sprintf("%.3f (%.3f–%.3f)", ci[2], ci[1], ci[3]), AUC_num = ci[2],
+                        Brier = round(brier(y, p_te), 4), Threshold = round(thr, 3),
+                        Sensitivity = round(tp / (tp + fn), 3), Specificity = round(tn / (tn + fp), 3),
+                        PPV = round(tp / max(tp + fp, 1), 3), NPV = round(tn / max(tn + fn, 1), 3),
+                        Accuracy = round((tp + tn) / length(y), 3),
+                        `Accuracy @0.5` = round(mean(as.integer(p_te >= 0.5) == y), 3),
+                        check.names = FALSE))
+}
+ho <- lapply(names(f_pred), function(m) eval_model(f_pred[[m]], m)); names(ho) <- names(f_pred)
+ho_tab <- bind_rows(lapply(ho, `[[`, "row"))
+kable(ho_tab %>% select(-AUC_num), caption = sprintf(
+  "Test-set performance (no-information accuracy = %.3f, i.e. always predicting 'not obese')",
+  1 - mean(test$obese)))
+save_tab(ho_tab, "week10_holdout_performance")
+```
+
+```{r roc-plot, fig.height=5.5}
+sel <- c("M0_AgeSex", "P1_adj", "P2_adj", "P3_adj", "P4_int")
+pROC::ggroc(lapply(ho[sel], `[[`, "roc"), legacy.axes = TRUE) +
+  geom_abline(linetype = "dashed", colour = "grey50") +
+  labs(title = "ROC curves on the test set", colour = "Model",
+       x = "1 – Specificity", y = "Sensitivity")
+```
+
+```{r delong}
+delong <- do.call(rbind, lapply(setdiff(names(ho), "M0_AgeSex"), function(m) {
+  t <- pROC::roc.test(ho$M0_AgeSex$roc, ho[[m]]$roc, method = "delong", paired = TRUE)
+  data.frame(Comparison = paste(m, "vs M0_AgeSex"),
+             `ΔAUC` = round(as.numeric(pROC::auc(ho[[m]]$roc) - pROC::auc(ho$M0_AgeSex$roc)), 3),
+             p = fmt_p(t$p.value), check.names = FALSE)
+}))
+t34 <- pROC::roc.test(ho$P3_adj$roc, ho$P4_int$roc, method = "delong", paired = TRUE)
+delong <- rbind(delong, data.frame(Comparison = "P4_int vs P3_adj",
+  `ΔAUC` = round(as.numeric(pROC::auc(ho$P4_int$roc) - pROC::auc(ho$P3_adj$roc)), 3),
+  p = fmt_p(t34$p.value), check.names = FALSE))
+kable(delong, caption = "DeLong tests: do the exposures improve discrimination beyond age and sex?")
+```
+
+## Repeated 10-fold cross-validation
+
+```{r cv}
+K <- 10; R <- 5
+cv_res <- list()
+for (r in seq_len(R)) {
+  folds <- integer(nrow(d_pred))
+  for (cls in 0:1) {                                   # stratified fold assignment
+    ii <- which(d_pred$obese == cls)
+    folds[ii] <- sample(rep(seq_len(K), length.out = length(ii)))
+  }
+  for (k in seq_len(K)) {
+    tr <- d_pred[folds != k, ]; te <- d_pred[folds == k, ]
+    for (m in names(f_pred)) {
+      fit <- glm(f_pred[[m]], data = tr, family = binomial)
+      p   <- predict(fit, te, type = "response")
+      cv_res[[length(cv_res) + 1]] <- data.frame(model = m, rep = r, fold = k,
+        auc = as.numeric(pROC::auc(mk_roc(te$obese, p))), brier = brier(te$obese, p))
+    }
+  }
+}
+cv_sum <- bind_rows(cv_res) %>% group_by(Model = model) %>%
+  summarise(`CV AUC mean` = round(mean(auc), 3), `CV AUC SD` = round(sd(auc), 3),
+            `CV Brier mean` = round(mean(brier), 4), .groups = "drop") %>%
+  arrange(desc(`CV AUC mean`))
+kable(cv_sum, caption = sprintf("%d × %d-fold cross-validation (null-model Brier = %.4f)",
+                                R, K, mean(d_pred$obese) * (1 - mean(d_pred$obese))))
+save_tab(cv_sum, "week10_cross_validation")
+
+ggplot(bind_rows(cv_res), aes(reorder(model, auc), auc)) +
+  geom_boxplot(fill = "steelblue", alpha = 0.4) + coord_flip() +
+  geom_hline(yintercept = 0.5, linetype = "dashed") +
+  labs(x = NULL, y = "AUC per fold", title = "Cross-validated AUC across 50 folds")
+```
+
+## Calibration of the full model (P4_int)
+
+```{r calibration, fig.height=4.5}
+p_full <- ho$P4_int$p
+hl <- hosmer_lemeshow(test$obese, p_full)
+cal_fit <- glm(test$obese ~ qlogis(p_full), family = binomial)
+cal_int <- glm(test$obese ~ offset(qlogis(p_full)), family = binomial)
+kable(data.frame(Statistic = c("Hosmer–Lemeshow χ²", "HL df", "HL p-value",
+                               "Calibration slope (ideal 1)", "Calibration-in-the-large (ideal 0)"),
+                 Value = unname(c(round(hl[1], 2), hl[2], fmt_p(hl[3]),
+                                  round(coef(cal_fit)[2], 3), round(coef(cal_int)[1], 3)))),
+      caption = "Calibration on the test set")
+
+cal_df <- data.frame(y = test$obese, p = p_full) %>%
+  mutate(bin = ntile(p, 10)) %>% group_by(bin) %>%
+  summarise(pred = mean(p), obs = mean(y), n = n(), .groups = "drop") %>%
+  mutate(se = sqrt(obs * (1 - obs) / n))
+ggplot(cal_df, aes(pred, obs)) +
+  geom_abline(linetype = "dashed") + geom_point(size = 2.5) +
+  geom_errorbar(aes(ymin = pmax(obs - 1.96 * se, 0), ymax = pmin(obs + 1.96 * se, 1)), width = 0.005) +
+  coord_equal(xlim = c(0, 0.6), ylim = c(0, 0.6)) +
+  labs(x = "Mean predicted probability (decile)", y = "Observed proportion obese",
+       title = "Calibration plot – full interaction model (test set)")
+```
+
+## Comparison with other classification methods
+
+Same predictors as the full model (Vit D deficiency, diabetes, UPF, age, sex). The tree uses equal priors so it does not
+collapse to "everyone not obese"; the kNN `k` is tuned by leave-one-out CV on the training set.
+
+```{r other-methods}
+xvars <- function(d) data.frame(age = d$age, upf = d$upf,
+                                vitd_def = as.integer(d$vitd_def == "Deficient"),
+                                diabetes = as.integer(d$diabetes == "Diabetes"),
+                                female = as.integer(d$sex == "Female"))
+Xtr <- xvars(train); Xte <- xvars(test)
+mu <- colMeans(Xtr); sdv <- apply(Xtr, 2, sd)
+Ztr <- scale(Xtr, mu, sdv); Zte <- scale(Xte, mu, sdv)
+f_x <- obese_f ~ vitd_def + diabetes + upf10 + age + sex
+
+# Linear discriminant analysis
+lda_fit <- MASS::lda(f_x, data = train)
+p_lda   <- predict(lda_fit, test)$posterior[, "Obese"]
+
+# Classification tree, pruned at the CV-optimal complexity
+tree <- rpart::rpart(f_x, data = train, method = "class", parms = list(prior = c(0.5, 0.5)),
+                     control = rpart::rpart.control(cp = 0.001, xval = 10, minbucket = 20))
+best_cp <- tree$cptable[which.min(tree$cptable[, "xerror"]), "CP"]
+tree_p  <- rpart::prune(tree, cp = best_cp)
+p_tree  <- predict(tree_p, test, type = "prob")[, "Obese"]
+
+# k-nearest neighbours, k tuned by LOOCV AUC on the training data
+knn_prob <- function(pred) ifelse(pred == "1", attr(pred, "prob"), 1 - attr(pred, "prob"))
+k_grid <- seq(5, 95, by = 10)
+k_auc  <- sapply(k_grid, function(k) as.numeric(pROC::auc(mk_roc(train$obese,
+            knn_prob(class::knn.cv(Ztr, factor(train$obese), k = k, prob = TRUE))))))
+k_best <- k_grid[which.max(k_auc)]
+p_knn  <- knn_prob(class::knn(Ztr, Zte, factor(train$obese), k = k_best, prob = TRUE))
+
+methods <- list(ho$P4_int$p, p_lda, p_tree, p_knn)
+names(methods) <- c("Logistic (P4_int)", "LDA", "Classification tree", paste0("kNN (k=", k_best, ")"))
+meth_tab <- bind_rows(lapply(names(methods), function(m) {
+  r <- mk_roc(test$obese, methods[[m]]); ci <- pROC::ci.auc(r)
+  data.frame(Method = m, AUC = sprintf("%.3f (%.3f–%.3f)", ci[2], ci[1], ci[3]),
+             Brier = round(brier(test$obese, methods[[m]]), 4))
+}))
+kable(meth_tab, caption = "Test-set comparison of classification methods")
+save_tab(meth_tab, "week10_method_comparison")
+```
+
+## K-means clustering
+
+K-means is **unsupervised**: it groups people by similarity in their characteristics without using obesity.
+We use it in three ways: (a) to see whether natural age–diet profiles in the data line up with obesity,
+(b) as a crude predictor (cluster membership) compared against the logistic model, and (c) to split the
+logistic model's predicted risks into low/medium/high groups as a check of risk stratification.
+
+```{r kmeans-k, fig.height=3.8}
+# Continuous inputs only: K-means uses Euclidean distance, so a 3-level variable such as
+# vitamin D would dominate the solution (clusters would just reproduce the vitamin D groups).
+# Clusters are therefore "age-diet profiles"; vitamin D, diabetes and obesity are compared afterwards.
+km_vars <- c("age", "SATPER1", "PEADDSD1", "energy_MJ")
+Zall <- scale(d_pred[, km_vars])
+k_try <- 2:8
+wss <- sapply(k_try, function(k) kmeans(Zall, k, nstart = 25, iter.max = 50)$tot.withinss)
+dmat <- dist(Zall)
+sil <- sapply(k_try, function(k) {
+  km <- kmeans(Zall, k, nstart = 25, iter.max = 50)
+  mean(cluster::silhouette(km$cluster, dmat)[, "sil_width"])
+})
+k_opt <- k_try[which.max(sil)]
+data.frame(k = k_try, WSS = wss, Silhouette = sil) %>%
+  pivot_longer(-k) %>%
+  ggplot(aes(k, value)) + geom_line() + geom_point() +
+  facet_wrap(~name, scales = "free_y") +
+  geom_vline(xintercept = k_opt, linetype = "dashed", colour = "firebrick") +
+  labs(title = sprintf("Choosing k: elbow (WSS) and average silhouette — chosen k = %d", k_opt))
+```
+
+```{r kmeans-profile}
+km <- kmeans(Zall, k_opt, nstart = 50, iter.max = 100)
+d_pred$cluster <- factor(km$cluster)
+
+prof <- d_pred %>% group_by(Cluster = cluster) %>%
+  summarise(n = n(), `Mean age` = round(mean(age), 1),
+            `Sat/trans fat %E` = round(mean(SATPER1), 1), `Added sugar %E` = round(mean(PEADDSD1), 1),
+            `Energy MJ/day` = round(mean(energy_MJ), 1),
+            `Vit D deficient %` = round(100 * mean(vitd_def == "Deficient"), 1),
+            `Female %` = round(100 * mean(sex == "Female"), 1),
+            `Diabetes %` = round(100 * mean(diabetes == "Diabetes"), 1),
+            `Obese %` = round(100 * mean(obese), 1), .groups = "drop")
+chi <- chisq.test(table(d_pred$cluster, d_pred$obese))
+kable(prof, caption = sprintf("Cluster profiles (χ² test of obesity across clusters: p = %s; adjusted Rand index vs obesity = %.3f)",
+                              fmt_p(chi$p.value), adj_rand(d_pred$cluster, d_pred$obese)))
+save_tab(prof, "week10_kmeans_profiles")
+
+pc <- prcomp(Zall)
+data.frame(PC1 = pc$x[, 1], PC2 = pc$x[, 2], Cluster = d_pred$cluster, Obese = d_pred$obese_f) %>%
+  ggplot(aes(PC1, PC2, colour = Cluster, shape = Obese)) +
+  geom_point(alpha = 0.5) + scale_shape_manual(values = c(1, 17)) +
+  labs(title = "K-means clusters on the first two principal components",
+       subtitle = sprintf("PC1 + PC2 explain %.0f%% of variance",
+                          100 * sum(pc$sdev[1:2]^2) / sum(pc$sdev^2)))
+```
+
+```{r kmeans-predict}
+# (b) Cluster membership as a predictor: fit K-means on the TRAINING data only,
+#     assign test cases to the nearest centroid, then compare test AUC with the logistic model.
+mu_k <- colMeans(train[, km_vars]); sd_k <- apply(train[, km_vars], 2, sd)
+Ztr_k <- scale(train[, km_vars], mu_k, sd_k); Zte_k <- scale(test[, km_vars], mu_k, sd_k)
+km_tr <- kmeans(Ztr_k, k_opt, nstart = 50, iter.max = 100)
+nearest <- function(Z, centers) apply(Z, 1, function(z) which.min(colSums((t(centers) - z)^2)))
+train$cl <- factor(km_tr$cluster, levels = seq_len(k_opt))
+test$cl  <- factor(nearest(Zte_k, km_tr$centers), levels = seq_len(k_opt))
+cl_fit <- glm(obese ~ cl, data = train, family = binomial)
+p_cl   <- predict(cl_fit, test, type = "response")
+
+# (c) K-means on the model's predicted risk → three risk groups; observed obesity should rise across groups
+risk_km <- kmeans(ho$P4_int$p, centers = 3, nstart = 25)
+ord <- order(risk_km$centers)
+risk_grp <- factor(match(risk_km$cluster, ord), 1:3, c("Low", "Medium", "High"))
+risk_tab <- data.frame(group = risk_grp, y = test$obese, p = ho$P4_int$p) %>%
+  group_by(`Risk group (K-means on predicted risk)` = group) %>%
+  summarise(n = n(), `Mean predicted %` = round(100 * mean(p), 1),
+            `Observed obese %` = round(100 * mean(y), 1), .groups = "drop")
+
+kable(data.frame(Predictor = c("K-means cluster membership", "Logistic regression (P4_int)"),
+                 `Test AUC` = round(c(as.numeric(pROC::auc(mk_roc(test$obese, p_cl))),
+                                      as.numeric(pROC::auc(ho$P4_int$roc))), 3),
+                 check.names = FALSE),
+      caption = "Does unsupervised clustering predict obesity as well as the supervised model?")
+kable(risk_tab, caption = "Risk stratification of the test set using K-means on predicted probabilities")
+```
+
+# Summary of findings (auto-filled)
+
+```{r summary-values, include=FALSE}
+best_cv <- cv_sum$Model[1]
+auc_m0  <- cv_sum$`CV AUC mean`[cv_sum$Model == "M0_AgeSex"]
+auc_p4  <- cv_sum$`CV AUC mean`[cv_sum$Model == "P4_int"]
+auc_cl  <- as.numeric(pROC::auc(mk_roc(test$obese, p_cl)))
+auc_lg  <- as.numeric(pROC::auc(ho$P4_int$roc))
+auc_word <- function(a) ifelse(a < 0.6, "poor", ifelse(a < 0.7, "modest", ifelse(a < 0.8, "acceptable", "good")))
+```
+
+**Week 9 – significance**
+
+* **Vitamin D (Person 1):** adjusted `r or_txt(sw$P1_adj, "vitd3ModSevere")` for moderate/severe deficiency
+  vs adequate; overall vitamin D effect `r sigtxt(p1_joint_a$p)` (joint p = `r fmt_p(p1_joint_a$p)`).
+* **UPF proxy (Person 2):** adjusted `r or_txt(sw$P2_adj_full, "upf10")` per +10 %E (full sample).
+* **Both (Person 3):** vitamin D `r or_txt(sw$P3_adj, "vitd3ModSevere")`; UPF `r or_txt(sw$P3_adj, "upf10")`.
+* **Interaction (Person 4):** `r or_txt(sw$P4_int, int_term, "ratio of ORs")` — `r sigtxt(p4_wald$p)`
+  (unweighted LRT p = `r fmt_p(p4_lrt[["Pr(>Chi)"]][2])`).
+* Lowest AIC: **`r w9$Model[which.min(w9$AIC)]`**.
+
+**Week 10 – prediction**
+
+* Best cross-validated model: **`r best_cv`**. Age + sex alone gave CV AUC = `r auc_m0`; the full model gave
+  CV AUC = `r auc_p4` (*`r auc_word(auc_p4)`* discrimination). The exposures are associated with obesity at the
+  population level, but `r ifelse(auc_p4 < 0.7, "they are weak tools for predicting whether an individual is obese", "they also discriminate reasonably between individuals")`.
+* Accuracy at a 0.5 threshold is close to the no-information rate (`r round(1 - mean(test$obese), 3)`) because
+  obesity is the minority class; this is why threshold-free metrics (AUC, Brier) and a Youden threshold are reported.
+* Calibration of the full model: Hosmer–Lemeshow p = `r fmt_p(hl[3])`, slope = `r round(coef(cal_fit)[2], 2)`.
+* K-means (k = `r k_opt`) produced clusters with obesity prevalence ranging from
+  `r min(prof$"Obese %")`% to `r max(prof$"Obese %")`% (χ² p = `r fmt_p(chi$p.value)`), but cluster membership
+  gave a test AUC of `r round(auc_cl, 3)` versus `r round(auc_lg, 3)` for the logistic model`r ifelse(auc_cl < auc_lg, ", as expected for a method that never sees the outcome", "")`.
+
+**Limitations to discuss:** cross-sectional data (reverse causation, especially obesity → low vitamin D); the UPF proxy
+is nutrient-based and from a single 24-hour recall; only `r sum(d_bio$diabetes == "Diabetes")` participants with
+diabetes (low power for the interaction); complete-case analysis restricted to biomedical participants; the
+full-sample design has no replicate weights, so its SEs may be slightly underestimated.
+
+```{r session, echo=FALSE}
+cat("Tables saved to:", normalizePath(out_dir), "\n")
+sessionInfo()
+```
